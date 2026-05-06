@@ -1,0 +1,22 @@
+# Claude
+.claude/
+CLAUDE.md
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Training output (large / generated)
+checkpoints/
+games/
+metrics/
+runs/
+
+# Notes
+plan.md
+pland.md
