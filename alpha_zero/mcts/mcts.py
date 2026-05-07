@@ -61,7 +61,7 @@ class MCTS:
         elif not root.expanded():
             self._expand_and_evaluate_batch([root], game, evaluator)
 
-        if add_exploration_noise and root.children:
+        if add_exploration_noise and root.expanded():
             self._add_dirichlet_noise(root)
 
         completed = 0
@@ -76,9 +76,14 @@ class MCTS:
                 node.apply_virtual_loss()
 
                 while node.expanded() and not is_terminal_fast(node.state):
-                    action, child = self._select_child(node)
+                    idx = self._select_child(node)
+                    if node.child_states[idx] is None:
+                        action = int(node.actions[idx])
+                        child_state, _, _ = _step_fast(game, node.state, action)
+                        node.child_states[idx] = child_state
+                    child = node.get_or_create_child(idx)
                     if child.state is None:
-                        child.state, _, _ = _step_fast(game, node.state, action)
+                        child.state = node.child_states[idx]
                     node = child
                     path.append(node)
                     node.apply_virtual_loss()
@@ -109,47 +114,36 @@ class MCTS:
         result_values = values_np.tolist()
 
         for node, encoded_tensor, policy in zip(nodes, encoded, policies):
-            # Cache the encoding so self-play can reuse it for the policy
-            # target instead of re-encoding the same position.
             node.encoded_state = encoded_tensor
             valid_actions = game.get_valid_actions(node.state)
-            masked_policy = policy[valid_actions]
-            total = masked_policy.sum()
+            masked = policy[valid_actions]
+            total = masked.sum()
             if total <= 0:
-                masked_policy = np.full(len(valid_actions), 1.0 / len(valid_actions))
+                masked = np.full(len(valid_actions), 1.0 / len(valid_actions), dtype=np.float32)
             else:
-                masked_policy = masked_policy / total
-            node.expand(zip(valid_actions.tolist(), masked_policy.tolist()))
+                masked = (masked / total).astype(np.float32, copy=False)
+            node.expand(valid_actions, masked)
 
         return result_values
 
     def _select_child(self, node):
-        best_action = None
-        best_child = None
-        best_score = -float("inf")
+        """Vectorized PUCT: returns the index in node's children arrays."""
+        visits = node.child_visits
+        value_sums = node.child_value_sums
+        priors = node.priors
 
-        parent_visits = max(1, node.visit_count)
-        sqrt_parent_visits = math.sqrt(parent_visits)
-        # Q-floor for unvisited children. Parent.value is from parent's STM POV;
-        # we assume an unvisited child is slightly worse than the parent's
-        # current expectation.
-        fpu_q = node.value - self.fpu_reduction
+        safe_visits = np.maximum(visits, 1)
+        q = -value_sums / safe_visits
+        # Unvisited children get the FPU floor.
+        if self.fpu_reduction != 0.0:
+            fpu_q = node.value - self.fpu_reduction
+            q = np.where(visits == 0, np.float32(fpu_q), q)
+        # else: unvisited get q=0 (legacy behavior; safe_visits=1 with sum=0).
 
-        for action, child in node.children.items():
-            if child.visit_count == 0:
-                q = fpu_q
-            else:
-                q = -child.value
-            u = self.c_puct * child.prior * (
-                sqrt_parent_visits / (1 + child.visit_count)
-            )
-            score = q + u
-            if score > best_score:
-                best_score = score
-                best_action = action
-                best_child = child
-
-        return best_action, best_child
+        parent_visits = node.visit_count if node.visit_count > 0 else 1
+        u = self.c_puct * priors * (math.sqrt(parent_visits) / (1 + visits))
+        score = q + u
+        return int(np.argmax(score))
 
     def _backpropagate(self, search_path, value):
         for node in reversed(search_path):
@@ -157,15 +151,13 @@ class MCTS:
             value = -value
 
     def _add_dirichlet_noise(self, root):
-        actions = list(root.children.keys())
-        noise = np.random.dirichlet(
-            [self.dirichlet_alpha] * len(actions)
-        )
-        # Re-mix from original_prior so noise does not compound across
+        n = int(root.priors.shape[0])
+        if n == 0:
+            return
+        noise = np.random.dirichlet([self.dirichlet_alpha] * n).astype(np.float32)
+        # Re-mix from original_priors so noise does not compound across
         # successive root re-uses in self-play.
-        for action, sample in zip(actions, noise):
-            child = root.children[action]
-            child.prior = (
-                (1 - self.dirichlet_epsilon) * child.original_prior
-                + self.dirichlet_epsilon * float(sample)
-            )
+        root.priors = (
+            (1 - self.dirichlet_epsilon) * root.original_priors
+            + self.dirichlet_epsilon * noise
+        ).astype(np.float32, copy=False)

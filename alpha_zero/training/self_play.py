@@ -98,11 +98,8 @@ def self_play_game(
             root=current_root,
         )
 
-        actions = np.array(list(root.children.keys()), dtype=np.int32)
-        visit_counts = np.array(
-            [root.children[action].visit_count for action in actions],
-            dtype=np.float32,
-        )
+        actions = root.actions
+        visit_counts = root.child_visits.astype(np.float32, copy=False)
         visit_probs = normalize_nonnegative(visit_counts)
 
         policy_target = np.zeros(game.action_space, dtype=np.float32)
@@ -134,9 +131,10 @@ def self_play_game(
         # Tree reuse: the chosen child becomes the new root. It is guaranteed
         # to be expanded (it had the highest sampled visit count, so MCTS
         # selected it at least once and ran expand_and_evaluate on it).
-        next_root = root.children.get(action)
+        idx = root.action_to_idx(int(action))
+        next_root = root.child_nodes[idx] if idx >= 0 else None
         if next_root is not None and next_root.expanded():
-            next_root.parent = None
+            next_root.detach_as_root()
             current_root = next_root
         else:
             current_root = None

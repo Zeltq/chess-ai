@@ -894,10 +894,8 @@ def choose_model_action(game, state, model, num_simulations):
         num_simulations=num_simulations,
         add_exploration_noise=False,
     )
-    best_action = max(
-        root.children.items(), key=lambda item: item[1].visit_count
-    )[0]
-    return best_action
+    best_idx = int(np.argmax(root.child_visits))
+    return int(root.actions[best_idx])
 
 
 def prompt_human_move(board):
