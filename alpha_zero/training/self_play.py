@@ -79,8 +79,16 @@ def self_play_game(
     capture_reward_cap=0.2,
     mcts_batch_size=8,
     fpu_reduction=0.25,
+    c_puct_base=None,
+    c_puct_init=1.25,
 ):
-    mcts = MCTS(c_puct=c_puct, batch_size=mcts_batch_size, fpu_reduction=fpu_reduction)
+    mcts = MCTS(
+        c_puct=c_puct,
+        batch_size=mcts_batch_size,
+        fpu_reduction=fpu_reduction,
+        c_puct_base=c_puct_base,
+        c_puct_init=c_puct_init,
+    )
     state = game.get_initial_state()
     history = []
     moves = []

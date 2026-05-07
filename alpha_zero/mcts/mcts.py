@@ -30,15 +30,19 @@ class MCTS:
         dirichlet_epsilon=0.25,
         batch_size=8,
         fpu_reduction=0.25,
+        c_puct_base=None,
+        c_puct_init=1.25,
     ):
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
         self.batch_size = batch_size
-        # First-Play Urgency: estimated Q for an unvisited child = parent.value
-        # minus this constant. With fpu_reduction=0 we revert to "Q=0", i.e.
-        # neutral, which over-explores unvisited siblings of strong children.
         self.fpu_reduction = fpu_reduction
+        # When c_puct_base is set, switch to the AlphaZero paper formula:
+        # c(N) = log((1 + N + c_base) / c_base) + c_init. Has a meaningful
+        # effect only at high simulation counts (N >> c_base ~ 19652).
+        self.c_puct_base = c_puct_base
+        self.c_puct_init = c_puct_init
 
     def run(self, game, state, evaluator, num_simulations, add_exploration_noise=False, root=None):
         """Run MCTS with the given evaluator.
@@ -141,7 +145,14 @@ class MCTS:
         # else: unvisited get q=0 (legacy behavior; safe_visits=1 with sum=0).
 
         parent_visits = node.visit_count if node.visit_count > 0 else 1
-        u = self.c_puct * priors * (math.sqrt(parent_visits) / (1 + visits))
+        if self.c_puct_base is not None:
+            c = (
+                math.log((1 + parent_visits + self.c_puct_base) / self.c_puct_base)
+                + self.c_puct_init
+            )
+        else:
+            c = self.c_puct
+        u = c * priors * (math.sqrt(parent_visits) / (1 + visits))
         score = q + u
         return int(np.argmax(score))
 

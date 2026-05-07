@@ -97,6 +97,15 @@ def parse_args():
         help="Half-move index after which temperature drops to 0 (greedy).",
     )
     train_parser.add_argument(
+        "--c-puct-base", type=float, default=None,
+        help="Enable AlphaZero log-c_puct: c(N) = log((1+N+base)/base) + init. "
+             "Recommended only with high simulation counts; default disables.",
+    )
+    train_parser.add_argument(
+        "--c-puct-init", type=float, default=1.25,
+        help="Init term in the log-c_puct formula (only used with --c-puct-base).",
+    )
+    train_parser.add_argument(
         "--parallel-games", type=int, default=1,
         help="Number of self-play games to run in parallel as Python threads "
              "sharing one GPU model via the InferenceServer. Default 1 = "
@@ -442,6 +451,8 @@ def train_command(args):
         "fpu_reduction": args.fpu_reduction,
         "temperature": args.temperature,
         "temperature_drop_move": args.temperature_drop_move,
+        "c_puct_base": args.c_puct_base,
+        "c_puct_init": args.c_puct_init,
     }
     if args.metrics_file is not None:
         metrics_file = args.metrics_file
