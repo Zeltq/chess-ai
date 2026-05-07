@@ -95,7 +95,7 @@ def _future_capture_bonus(history, capture_rewards, scale, cap):
 
 def self_play_game(
     game,
-    net,
+    evaluator,
     num_simulations,
     temperature=0.8,
     temperature_drop_move=20,
@@ -119,7 +119,7 @@ def self_play_game(
         root = mcts.run(
             game,
             state,
-            net,
+            evaluator,
             num_simulations=num_simulations,
             add_exploration_noise=True,
             root=current_root,

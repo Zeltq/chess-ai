@@ -1,9 +1,8 @@
 import argparse
 import csv
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 import math
-import os
 from pathlib import Path
 import time
 
@@ -20,45 +19,7 @@ from training.buffer import ReplayBuffer
 from training.self_play import find_immediate_checkmate_action, self_play_game
 from training.train import build_batch, train_on_batch
 from mcts.mcts import MCTS
-
-
-# --- Parallel self-play worker (module-level required for multiprocessing spawn on Windows) ---
-
-_worker_state = {}
-
-
-def _init_worker(model_config, device_str, cwd):
-    import sys
-    os.chdir(cwd)
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
-    torch.set_num_threads(1)
-    device = torch.device(device_str)
-    if device.type == "cuda":
-        torch.set_float32_matmul_precision("high")
-    from env.chess_env import Chess as _Chess
-    from model.net import AlphaZeroNet as _Net
-    _worker_state["game"] = _Chess()
-    net = _Net(**model_config).to(device)
-    if device.type == "cuda":
-        net = net.to(memory_format=torch.channels_last)
-    _worker_state["net"] = net
-
-
-def _run_worker_game(args):
-    state_dict, game_kwargs = args
-    net = _worker_state["net"]
-    net.load_state_dict(state_dict)
-    net.eval()
-    t0 = time.perf_counter()
-    from training.self_play import self_play_game as _spg
-    samples, final_state, moves, result = _spg(game=_worker_state["game"], net=net, **game_kwargs)
-    # Convert state tensors to numpy — avoids PyTorch FD-based shared memory IPC
-    samples = [(s.numpy(), p, v) for s, p, v in samples]
-    return samples, final_state, moves, result, time.perf_counter() - t0
-
-
-# -----------------------------------------------------------------------------------------
+from mcts.inference import InferenceServer, LocalEvaluator
 
 
 def parse_args():
@@ -114,8 +75,19 @@ def parse_args():
     )
     train_parser.add_argument(
         "--parallel-games", type=int, default=1,
-        help="Number of self-play games to run in parallel (separate processes). "
-             "Default 1 = sequential. Recommended: number of CPU cores.",
+        help="Number of self-play games to run in parallel as Python threads "
+             "sharing one GPU model via the InferenceServer. Default 1 = "
+             "sequential with a LocalEvaluator.",
+    )
+    train_parser.add_argument(
+        "--server-batch-size", type=int, default=256,
+        help="Max batch the inference server will assemble before flushing. "
+             "Larger = better GPU utilisation, slightly higher latency.",
+    )
+    train_parser.add_argument(
+        "--server-max-wait-ms", type=float, default=2.0,
+        help="How long the inference server waits for more requests before "
+             "flushing a partial batch.",
     )
     train_parser.add_argument("--eval-engine", type=Path, default=None)
     train_parser.add_argument("--eval-time", type=float, default=0.05)
@@ -380,14 +352,24 @@ def train_command(args):
         if device.type == "cuda" and amp_dtype == torch.float16
         else None
     )
-    executor = None
+    # Self-play parallelism: when parallel-games > 1 we run a single GPU
+    # model + an InferenceServer in the main process, and spawn a thread
+    # pool of MCTS workers. Each worker is a Python thread; the GIL is
+    # released during chess.Board operations (C extension) and during
+    # torch GPU forwards, so threads make progress concurrently.
+    inference_server = None
+    selfplay_pool = None
     if args.parallel_games > 1:
-        import multiprocessing
-        executor = ProcessPoolExecutor(
+        if device.type == "cuda":
+            inference_server = InferenceServer(
+                model,
+                device,
+                max_batch_size=args.server_batch_size,
+                max_wait_seconds=args.server_max_wait_ms / 1000.0,
+            )
+        selfplay_pool = ThreadPoolExecutor(
             max_workers=args.parallel_games,
-            initializer=_init_worker,
-            initargs=(model_config, str(device), os.getcwd()),
-            mp_context=multiprocessing.get_context("spawn"),
+            thread_name_prefix="selfplay",
         )
     replay_buffer = ReplayBuffer(args.buffer_size)
     run_id = timestamp_slug()
@@ -414,8 +396,13 @@ def train_command(args):
             load_buffer(replay_buffer, buffer_path)
             print_kv("resume", [("buffer", f"{len(replay_buffer)} positions loaded from {buffer_path.name}")])
 
-    # Compile after weights are loaded so the first forward pass triggers compile on real shapes.
-    model = maybe_compile(model, device)
+    # Compile after weights are loaded so the first forward pass triggers
+    # compile on real shapes. Skipped automatically when an InferenceServer
+    # is in play (variable batch sizes would re-trigger compilation).
+    if inference_server is None:
+        model = maybe_compile(model, device)
+
+    local_evaluator = LocalEvaluator(model, device)
 
     eval_engine = None
     if args.eval_engine is not None:
@@ -543,18 +530,26 @@ def train_command(args):
 
         game_times = []
 
-        if executor is not None:
-            state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
-            futures = {
-                executor.submit(_run_worker_game, (state_dict, game_kwargs)): gi
+        # Shared model is the source of truth. Server reads its parameters
+        # (in place) every batch, so weight updates from training propagate
+        # automatically without any state_dict broadcast.
+        evaluator = inference_server if inference_server is not None else local_evaluator
+
+        if selfplay_pool is not None:
+            def _run_one(gi):
+                t0 = time.perf_counter()
+                s, fs, mv, r = self_play_game(game=game, evaluator=evaluator, **game_kwargs)
+                return gi, s, fs, mv, r, time.perf_counter() - t0
+            futures = [
+                selfplay_pool.submit(_run_one, gi)
                 for gi in range(1, args.games_per_iteration + 1)
-            }
-            games_source = ((futures[f], *f.result()) for f in as_completed(futures))
+            ]
+            games_source = (f.result() for f in as_completed(futures))
         else:
             def _seq():
                 for gi in range(1, args.games_per_iteration + 1):
                     t0 = time.perf_counter()
-                    s, fs, mv, r = self_play_game(game=game, net=model, **game_kwargs)
+                    s, fs, mv, r = self_play_game(game=game, evaluator=evaluator, **game_kwargs)
                     yield gi, s, fs, mv, r, time.perf_counter() - t0
             games_source = _seq()
 
@@ -593,7 +588,7 @@ def train_command(args):
                     engine_metrics.append(metrics)
 
             completed_count = len(game_times)
-            if executor is None:
+            if selfplay_pool is None:
                 avg_game_time = sum(game_times) / completed_count
                 eta_sp_str = format_duration(
                     (args.games_per_iteration - completed_count) * avg_game_time
@@ -844,8 +839,10 @@ def train_command(args):
             print_kv("stop", [("reason", "time limit reached after checkpoint")])
             break
 
-    if executor is not None:
-        executor.shutdown(wait=False)
+    if selfplay_pool is not None:
+        selfplay_pool.shutdown(wait=True)
+    if inference_server is not None:
+        inference_server.stop()
     if eval_engine is not None:
         eval_engine.quit()
     if writer is not None:
@@ -858,11 +855,13 @@ def choose_model_action(game, state, model, num_simulations):
         return mate_action
 
     model.eval()
+    device = next(model.parameters()).device
+    evaluator = LocalEvaluator(model, device)
     mcts = MCTS(c_puct=1.5)
     root = mcts.run(
         game,
         state,
-        model,
+        evaluator,
         num_simulations=num_simulations,
         add_exploration_noise=False,
     )

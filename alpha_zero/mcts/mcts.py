@@ -29,7 +29,14 @@ class MCTS:
         self.dirichlet_epsilon = dirichlet_epsilon
         self.batch_size = batch_size
 
-    def run(self, game, state, net, num_simulations, add_exploration_noise=False, root=None):
+    def run(self, game, state, evaluator, num_simulations, add_exploration_noise=False, root=None):
+        """Run MCTS with the given evaluator.
+
+        `evaluator` is a callable: state_tensors -> (policies_np, values_np)
+        where state_tensors is a CPU tensor (B, C, H, W). Both LocalEvaluator
+        (in-process) and InferenceServer (cross-thread batching) satisfy
+        this contract.
+        """
         # MCTS internal nodes use stack=False copies: full move history
         # (3-fold / 50-move detection) is unnecessary inside the tree and
         # would make late-game copies O(plies). Real game termination is
@@ -37,12 +44,11 @@ class MCTS:
         is_terminal_fast = getattr(game, "is_terminal_fast", game.is_terminal)
         get_reward_fast = getattr(game, "get_reward_fast", game.get_reward)
 
-        device = next(net.parameters()).device
         if root is None:
             root = Node(_copy_fast(game, state))
-            self._expand_and_evaluate_batch([root], game, net, device)
+            self._expand_and_evaluate_batch([root], game, evaluator)
         elif not root.expanded():
-            self._expand_and_evaluate_batch([root], game, net, device)
+            self._expand_and_evaluate_batch([root], game, evaluator)
 
         if add_exploration_noise and root.children:
             self._add_dirichlet_noise(root)
@@ -76,7 +82,7 @@ class MCTS:
                     search_paths.append(path)
 
             if to_expand:
-                values = self._expand_and_evaluate_batch(to_expand, game, net, device)
+                values = self._expand_and_evaluate_batch(to_expand, game, evaluator)
                 for node, path, value in zip(to_expand, search_paths, values):
                     for n in path:
                         n.undo_virtual_loss()
@@ -85,23 +91,10 @@ class MCTS:
 
         return root
 
-    def _expand_and_evaluate_batch(self, nodes, game, net, device):
-        state_tensors = torch.stack([game.encode_state(n.state) for n in nodes]).to(device)
-        if device.type == "cuda":
-            state_tensors = state_tensors.contiguous(memory_format=torch.channels_last)
-            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        else:
-            amp_dtype = torch.float32
-        with torch.inference_mode():
-            with torch.autocast(
-                device_type=device.type,
-                dtype=amp_dtype,
-                enabled=device.type == "cuda",
-            ):
-                policy_logits_batch, values_batch = net(state_tensors)
-
-        policies = torch.softmax(policy_logits_batch.float(), dim=-1).cpu().numpy()
-        result_values = values_batch.float().squeeze(-1).cpu().numpy().tolist()
+    def _expand_and_evaluate_batch(self, nodes, game, evaluator):
+        state_tensors = torch.stack([game.encode_state(n.state) for n in nodes])
+        policies, values_np = evaluator(state_tensors)
+        result_values = values_np.tolist()
 
         for node, policy in zip(nodes, policies):
             valid_actions = game.get_valid_actions(node.state)
