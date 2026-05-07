@@ -49,11 +49,6 @@ def parse_args():
     train_parser.add_argument("--draw-score", type=float, default=0.45)
     train_parser.add_argument("--capture-reward-scale", type=float, default=0.01)
     train_parser.add_argument("--capture-reward-cap", type=float, default=0.2)
-    train_parser.add_argument(
-        "--allow-immediate-draws",
-        action="store_true",
-        help="Allow self-play to choose moves that immediately claim a draw.",
-    )
     train_parser.add_argument("--buffer-size", type=int, default=50000)
     train_parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
     train_parser.add_argument("--records-dir", type=Path, default=Path("games"))
@@ -413,7 +408,6 @@ def train_command(args):
         "num_simulations": args.simulations,
         "max_moves": args.max_moves,
         "draw_value": draw_value,
-        "avoid_immediate_draws": not args.allow_immediate_draws,
         "capture_reward_scale": args.capture_reward_scale,
         "capture_reward_cap": args.capture_reward_cap,
         "mcts_batch_size": args.mcts_batch_size,
@@ -446,7 +440,6 @@ def train_command(args):
                 "capture",
                 f"{args.capture_reward_scale:g} cap {args.capture_reward_cap:g}",
             ),
-            ("avoid_draws", "no" if args.allow_immediate_draws else "yes"),
         ],
     )
     print_kv(
@@ -718,7 +711,6 @@ def train_command(args):
             "max_moves": args.max_moves,
             "draw_score": args.draw_score,
             "draw_value": draw_value,
-            "avoid_immediate_draws": not args.allow_immediate_draws,
             "capture_reward_scale": args.capture_reward_scale,
             "capture_reward_cap": args.capture_reward_cap,
             "epochs": args.epochs,
@@ -815,7 +807,6 @@ def train_command(args):
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
                 "draw_score": args.draw_score,
-                "avoid_immediate_draws": not args.allow_immediate_draws,
                 "capture_reward_scale": args.capture_reward_scale,
                 "capture_reward_cap": args.capture_reward_cap,
                 "positions": iteration_samples,

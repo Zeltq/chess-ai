@@ -23,33 +23,6 @@ def _sample_action(actions, probabilities, temperature):
     return int(np.random.choice(actions, p=scaled))
 
 
-def _move_draws_immediately(game, state, action):
-    next_state = game.copy_state(state)
-    move = game.action_to_move(action, next_state)
-    next_state.push(move)
-    outcome = next_state.outcome(claim_draw=True)
-    return outcome is not None and outcome.winner is None
-
-
-def _avoid_immediate_draws(game, state, actions, probabilities):
-    if len(actions) <= 1:
-        return probabilities, 0
-
-    keep_mask = np.array(
-        [
-            not _move_draws_immediately(game, state, int(action))
-            for action in actions
-        ],
-        dtype=bool,
-    )
-    if keep_mask.all() or not keep_mask.any():
-        return probabilities, 0
-
-    filtered = probabilities.copy()
-    filtered[~keep_mask] = 0.0
-    return normalize_nonnegative(filtered), int((~keep_mask).sum())
-
-
 def find_immediate_checkmate_action(game, state):
     for move in state.legal_moves:
         next_state = game.copy_state(state)
@@ -102,7 +75,6 @@ def self_play_game(
     c_puct=1.5,
     max_moves=None,
     draw_value=0,
-    avoid_immediate_draws=True,
     capture_reward_scale=0.01,
     capture_reward_cap=0.2,
     mcts_batch_size=8,
@@ -131,14 +103,6 @@ def self_play_game(
             dtype=np.float32,
         )
         visit_probs = normalize_nonnegative(visit_counts)
-        avoided_draw_actions = 0
-        if avoid_immediate_draws:
-            visit_probs, avoided_draw_actions = _avoid_immediate_draws(
-                game,
-                state,
-                actions,
-                visit_probs,
-            )
 
         policy_target = np.zeros(game.action_space, dtype=np.float32)
         policy_target[actions] = visit_probs
@@ -153,7 +117,6 @@ def self_play_game(
                 "state": encoded_state,
                 "policy": policy_target,
                 "player": state.turn,
-                "forced_draw_avoidance": avoided_draw_actions,
             }
         )
 
