@@ -143,9 +143,14 @@ def self_play_game(
         policy_target = np.zeros(game.action_space, dtype=np.float32)
         policy_target[actions] = visit_probs
 
+        # Reuse the encoded tensor MCTS already produced for the root —
+        # avoids encoding the same position twice per move.
+        encoded_state = root.encoded_state
+        if encoded_state is None:
+            encoded_state = game.encode_state(state)
         history.append(
             {
-                "state": game.encode_state(state),
+                "state": encoded_state,
                 "policy": policy_target,
                 "player": state.turn,
                 "forced_draw_avoidance": avoided_draw_actions,

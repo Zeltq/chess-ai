@@ -92,11 +92,15 @@ class MCTS:
         return root
 
     def _expand_and_evaluate_batch(self, nodes, game, evaluator):
-        state_tensors = torch.stack([game.encode_state(n.state) for n in nodes])
+        encoded = [game.encode_state(n.state) for n in nodes]
+        state_tensors = torch.stack(encoded)
         policies, values_np = evaluator(state_tensors)
         result_values = values_np.tolist()
 
-        for node, policy in zip(nodes, policies):
+        for node, encoded_tensor, policy in zip(nodes, encoded, policies):
+            # Cache the encoding so self-play can reuse it for the policy
+            # target instead of re-encoding the same position.
+            node.encoded_state = encoded_tensor
             valid_actions = game.get_valid_actions(node.state)
             masked_policy = policy[valid_actions]
             total = masked_policy.sum()

@@ -11,6 +11,10 @@ class Node:
         self.children = {}
         self.visit_count = 0
         self.value_sum = 0.0
+        # Encoded board tensor cached when the node is first expanded;
+        # lets self-play reuse the encoding for the policy target without
+        # re-encoding the same position.
+        self.encoded_state = None
 
     @property
     def value(self):
