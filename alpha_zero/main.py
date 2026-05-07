@@ -129,6 +129,11 @@ def parse_args():
         "--reset-lr", action="store_true",
         help="Ignore saved scheduler state and reset LR to --learning-rate with new milestones.",
     )
+    train_parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Seed numpy / random / torch RNGs for reproducibility. CUDA is "
+             "still non-deterministic at the kernel level even with a seed.",
+    )
 
     play_parser = subparsers.add_parser("play", help="Play against a saved checkpoint")
     play_parser.add_argument("--checkpoint", type=Path, required=True)
@@ -346,6 +351,14 @@ def train_command(args):
         raise ValueError("--capture-reward-scale must be non-negative")
     if not 0.0 <= args.capture_reward_cap <= 1.0:
         raise ValueError("--capture-reward-cap must be between 0 and 1")
+
+    if args.seed is not None:
+        import random as _random
+        _random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
 
     device = select_device()
     if device.type == "cuda":
