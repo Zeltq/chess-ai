@@ -6,6 +6,22 @@ import torch
 from .node import Node
 
 
+def _copy_fast(game, state):
+    """Copy a state without move history when the game supports it."""
+    try:
+        return game.copy_state(state, stack=False)
+    except TypeError:
+        return game.copy_state(state)
+
+
+def _step_fast(game, state, action):
+    """Step a state without retaining move history when the game supports it."""
+    try:
+        return game.step(state, action, stack=False)
+    except TypeError:
+        return game.step(state, action)
+
+
 class MCTS:
     def __init__(self, c_puct=1.5, dirichlet_alpha=0.3, dirichlet_epsilon=0.25, batch_size=8):
         self.c_puct = c_puct
@@ -14,7 +30,14 @@ class MCTS:
         self.batch_size = batch_size
 
     def run(self, game, state, net, num_simulations, add_exploration_noise=False):
-        root = Node(game.copy_state(state))
+        # MCTS internal nodes use stack=False copies: full move history
+        # (3-fold / 50-move detection) is unnecessary inside the tree and
+        # would make late-game copies O(plies). Real game termination is
+        # still enforced by the outer self-play loop with strict is_terminal.
+        is_terminal_fast = getattr(game, "is_terminal_fast", game.is_terminal)
+        get_reward_fast = getattr(game, "get_reward_fast", game.get_reward)
+
+        root = Node(_copy_fast(game, state))
         device = next(net.parameters()).device
         self._expand_and_evaluate_batch([root], game, net, device)
 
@@ -32,18 +55,18 @@ class MCTS:
                 path = [node]
                 node.apply_virtual_loss()
 
-                while node.expanded() and not game.is_terminal(node.state):
+                while node.expanded() and not is_terminal_fast(node.state):
                     action, child = self._select_child(node)
                     if child.state is None:
-                        child.state, _, _ = game.step(node.state, action)
+                        child.state, _, _ = _step_fast(game, node.state, action)
                     node = child
                     path.append(node)
                     node.apply_virtual_loss()
 
-                if game.is_terminal(node.state):
+                if is_terminal_fast(node.state):
                     for n in path:
                         n.undo_virtual_loss()
-                    self._backpropagate(path, game.get_reward(node.state))
+                    self._backpropagate(path, get_reward_fast(node.state))
                     completed += 1
                 else:
                     to_expand.append(node)

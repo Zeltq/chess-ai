@@ -43,8 +43,8 @@ class Chess(Game):
     def get_initial_state(self):
         return chess.Board()
 
-    def copy_state(self, state):
-        return state.copy(stack=True)
+    def copy_state(self, state, stack=True):
+        return state.copy(stack=stack)
 
     def get_valid_actions(self, state):
         return np.array(
@@ -52,15 +52,19 @@ class Chess(Game):
             dtype=np.int32,
         )
 
-    def step(self, state, action):
+    def step(self, state, action, stack=True):
         move = self.action_to_move(action, state)
         if move not in state.legal_moves:
             raise ValueError(f"Illegal move for current position: {move.uci()}")
 
-        next_state = state.copy(stack=True)
+        next_state = state.copy(stack=stack)
         next_state.push(move)
-        done = self.is_terminal(next_state)
-        reward = self.get_reward(next_state) if done else 0.0
+        if stack:
+            done = self.is_terminal(next_state)
+            reward = self.get_reward(next_state) if done else 0.0
+        else:
+            done = self.is_terminal_fast(next_state)
+            reward = self.get_reward_fast(next_state) if done else 0.0
         return next_state, reward, done
 
     def is_terminal(self, state):
@@ -71,6 +75,28 @@ class Chess(Game):
         if outcome is None or outcome.winner is None:
             return 0.0
         return 1.0 if outcome.winner == state.turn else -1.0
+
+    def is_terminal_fast(self, state):
+        """Cheap terminal check for MCTS rollouts: skips claim_draw (50-move/3-fold).
+
+        Misses repetition/50-move draws inside the search tree, but those are
+        rare at MCTS depth and missing them only delays exploration cutoff —
+        the real game loop still uses the strict is_terminal.
+        """
+        if state.is_checkmate():
+            return True
+        if state.is_stalemate():
+            return True
+        if state.is_insufficient_material():
+            return True
+        return False
+
+    def get_reward_fast(self, state):
+        """Reward matching is_terminal_fast: only checkmate gives ±1."""
+        if state.is_checkmate():
+            # state.turn is the side that just got mated and has no legal reply.
+            return -1.0
+        return 0.0
 
     def get_result(self, state):
         outcome = state.outcome(claim_draw=True)
