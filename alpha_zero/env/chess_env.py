@@ -92,12 +92,18 @@ class Chess(Game):
         next_state = state.copy(stack=stack)
         next_state.push(move)
         if stack:
-            done = self.is_terminal(next_state)
-            reward = self.get_reward(next_state) if done else 0.0
-        else:
-            done = self.is_terminal_fast(next_state)
-            reward = self.get_reward_fast(next_state) if done else 0.0
-        return next_state, reward, done
+            # One outcome() call covers both done and reward, vs. two separate
+            # outcome() calls when delegating to is_terminal / get_reward.
+            outcome = next_state.outcome(claim_draw=True)
+            if outcome is None:
+                return next_state, 0.0, False
+            if outcome.winner is None:
+                return next_state, 0.0, True
+            reward = 1.0 if outcome.winner == next_state.turn else -1.0
+            return next_state, reward, True
+        if self.is_terminal_fast(next_state):
+            return next_state, self.get_reward_fast(next_state), True
+        return next_state, 0.0, False
 
     def is_terminal(self, state):
         return state.outcome(claim_draw=True) is not None
