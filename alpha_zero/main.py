@@ -81,6 +81,15 @@ def parse_args():
              "is parent.value - fpu_reduction. Set 0 for the legacy Q=0 behavior.",
     )
     train_parser.add_argument(
+        "--temperature", type=float, default=1.0,
+        help="Sampling temperature applied to MCTS visit counts during the "
+             "opening (until --temperature-drop-move). 1.0 = match AZ paper.",
+    )
+    train_parser.add_argument(
+        "--temperature-drop-move", type=int, default=30,
+        help="Half-move index after which temperature drops to 0 (greedy).",
+    )
+    train_parser.add_argument(
         "--parallel-games", type=int, default=1,
         help="Number of self-play games to run in parallel as Python threads "
              "sharing one GPU model via the InferenceServer. Default 1 = "
@@ -424,6 +433,8 @@ def train_command(args):
         "capture_reward_cap": args.capture_reward_cap,
         "mcts_batch_size": args.mcts_batch_size,
         "fpu_reduction": args.fpu_reduction,
+        "temperature": args.temperature,
+        "temperature_drop_move": args.temperature_drop_move,
     }
     if args.metrics_file is not None:
         metrics_file = args.metrics_file
