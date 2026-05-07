@@ -49,6 +49,13 @@ def parse_args():
     train_parser.add_argument("--draw-score", type=float, default=0.45)
     train_parser.add_argument("--capture-reward-scale", type=float, default=0.01)
     train_parser.add_argument("--capture-reward-cap", type=float, default=0.2)
+    train_parser.add_argument(
+        "--capture-reward-ramp-iterations", type=int, default=None,
+        help="Linearly decay capture_reward_scale to zero over this many "
+             "iterations (default: max(1, iterations // 3)). Capture-reward "
+             "shaping helps bootstrap early but biases value targets toward "
+             "materialism in the long run, so it ramps off.",
+    )
     train_parser.add_argument("--buffer-size", type=int, default=50000)
     train_parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
     train_parser.add_argument("--records-dir", type=Path, default=Path("games"))
@@ -504,12 +511,26 @@ def train_command(args):
     )
     total_iterations = args.iterations - start_iteration + 1
 
+    capture_ramp_iters = max(
+        1,
+        args.capture_reward_ramp_iterations
+        if args.capture_reward_ramp_iterations is not None
+        else args.iterations // 3,
+    )
+
     for iteration in range(start_iteration, args.iterations + 1):
         iteration_started_at = time.perf_counter()
         model.eval()
         iteration_samples = 0
         results = {"white_wins": 0, "black_wins": 0, "draws": 0}
         engine_metrics = []
+
+        # Linear ramp-down: full scale at iteration 1, zero from
+        # capture_ramp_iters onward.
+        ramp_progress = max(0.0, 1.0 - (iteration - 1) / capture_ramp_iters)
+        game_kwargs["capture_reward_scale"] = (
+            args.capture_reward_scale * ramp_progress
+        )
 
         if completed_iteration_times:
             avg_iter_time = sum(completed_iteration_times) / len(completed_iteration_times)
