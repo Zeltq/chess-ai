@@ -3,7 +3,7 @@ import numpy as np
 import torch
 
 from .game import Game
-from utils.fast_chess import action_to_components, move_to_action_index
+from utils.fast_chess import action_to_components, move_to_action_index, moves_to_actions
 
 
 _PIECE_TYPE_ORDER = (
@@ -71,10 +71,18 @@ class Chess(Game):
         return state.copy(stack=stack)
 
     def get_valid_actions(self, state):
-        return np.array(
-            [self.move_to_action(move, state.turn) for move in state.legal_moves],
-            dtype=np.int32,
-        )
+        moves = list(state.legal_moves)
+        n = len(moves)
+        if n == 0:
+            return np.empty(0, dtype=np.int32)
+        from_sq = np.empty(n, dtype=np.int32)
+        to_sq = np.empty(n, dtype=np.int32)
+        promo = np.empty(n, dtype=np.int32)
+        for i, m in enumerate(moves):
+            from_sq[i] = m.from_square
+            to_sq[i] = m.to_square
+            promo[i] = m.promotion or 0
+        return moves_to_actions(from_sq, to_sq, promo, state.turn == chess.BLACK)
 
     def step(self, state, action, stack=True):
         move = self.action_to_move(action, state)

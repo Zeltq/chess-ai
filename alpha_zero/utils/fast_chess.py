@@ -215,6 +215,21 @@ def action_to_components(action, is_black, piece_type):
 
 
 @_maybe_jit
+def moves_to_actions(from_squares, to_squares, promotions, is_black):
+    """Vectorized move_to_action_index over a batch of legal moves."""
+    n = from_squares.shape[0]
+    out = np.empty(n, dtype=np.int32)
+    for i in range(n):
+        out[i] = move_to_action_index(
+            from_squares[i],
+            to_squares[i],
+            promotions[i],
+            is_black,
+        )
+    return out
+
+
+@_maybe_jit
 def normalize_nonnegative(values):
     total = 0.0
     for value in values:
