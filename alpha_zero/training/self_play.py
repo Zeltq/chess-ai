@@ -115,27 +115,10 @@ def self_play_game(
     move_index = 0
 
     while not game.is_terminal(state) and (max_moves is None or move_index < max_moves):
-        mate_action = find_immediate_checkmate_action(game, state)
-        if mate_action is not None:
-            policy_target = np.zeros(game.action_space, dtype=np.float32)
-            policy_target[mate_action] = 1.0
-            history.append(
-                {
-                    "state": game.encode_state(state),
-                    "policy": policy_target,
-                    "player": state.turn,
-                    "forced_draw_avoidance": 0,
-                }
-            )
-
-            move = game.action_to_move(mate_action, state)
-            mover = state.turn
-            captured_value = _captured_piece_value(state, move)
-            state, _, _ = game.step(state, mate_action)
-            moves.append(move)
-            capture_rewards.append((mover, captured_value))
-            move_index += 1
-            break
+        # Mate-in-1 scanning was previously short-circuited here. Removed: it
+        # iterated all legal moves and copy/push'd a board for each, costing
+        # ~30 board copies per ply. MCTS finds mate-in-1 in a few simulations
+        # via the +1 terminal reward, so the scan was net-negative.
 
         root = mcts.run(
             game,
