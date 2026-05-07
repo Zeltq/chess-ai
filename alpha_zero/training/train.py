@@ -31,7 +31,7 @@ def train_on_batch(net, optimizer, batch, device, scaler=None):
 
 
 def build_batch(samples):
-    states = torch.stack([sample[0].float() for sample in samples], dim=0)
+    states = torch.stack([torch.as_tensor(sample[0], dtype=torch.float32) for sample in samples], dim=0)
     policies = torch.stack(
         [torch.as_tensor(sample[1], dtype=torch.float32) for sample in samples], dim=0
     )

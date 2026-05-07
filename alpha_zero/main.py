@@ -1,7 +1,9 @@
 import argparse
 import csv
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import UTC, datetime
 import math
+import os
 from pathlib import Path
 import time
 
@@ -18,6 +20,40 @@ from training.buffer import ReplayBuffer
 from training.self_play import find_immediate_checkmate_action, self_play_game
 from training.train import build_batch, train_on_batch
 from mcts.mcts import MCTS
+
+
+# --- Parallel self-play worker (module-level required for multiprocessing spawn on Windows) ---
+
+_worker_state = {}
+
+
+def _init_worker(model_config, device_str, cwd):
+    import sys
+    os.chdir(cwd)
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+    torch.set_num_threads(1)
+    device = torch.device(device_str)
+    from env.chess_env import Chess as _Chess
+    from model.net import AlphaZeroNet as _Net
+    _worker_state["game"] = _Chess()
+    _worker_state["net"] = _Net(**model_config).to(device)
+
+
+def _run_worker_game(args):
+    state_dict, game_kwargs = args
+    net = _worker_state["net"]
+    net.load_state_dict(state_dict)
+    net.eval()
+    t0 = time.perf_counter()
+    from training.self_play import self_play_game as _spg
+    samples, final_state, moves, result = _spg(game=_worker_state["game"], net=net, **game_kwargs)
+    # Convert state tensors to numpy — avoids PyTorch FD-based shared memory IPC
+    samples = [(s.numpy(), p, v) for s, p, v in samples]
+    return samples, final_state, moves, result, time.perf_counter() - t0
+
+
+# -----------------------------------------------------------------------------------------
 
 
 def parse_args():
@@ -71,10 +107,19 @@ def parse_args():
         "--mcts-batch-size", type=int, default=8,
         help="Leaves evaluated per NN forward pass in MCTS. Higher = better GPU utilization.",
     )
+    train_parser.add_argument(
+        "--parallel-games", type=int, default=1,
+        help="Number of self-play games to run in parallel (separate processes). "
+             "Default 1 = sequential. Recommended: number of CPU cores.",
+    )
     train_parser.add_argument("--eval-engine", type=Path, default=None)
     train_parser.add_argument("--eval-time", type=float, default=0.05)
     train_parser.add_argument("--eval-games", type=int, default=1)
     train_parser.add_argument("--resume", type=Path, default=None)
+    train_parser.add_argument(
+        "--reset-lr", action="store_true",
+        help="Ignore saved scheduler state and reset LR to --learning-rate with new milestones.",
+    )
 
     play_parser = subparsers.add_parser("play", help="Play against a saved checkpoint")
     play_parser.add_argument("--checkpoint", type=Path, required=True)
@@ -303,6 +348,15 @@ def train_command(args):
     )
 
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    executor = None
+    if args.parallel_games > 1:
+        import multiprocessing
+        executor = ProcessPoolExecutor(
+            max_workers=args.parallel_games,
+            initializer=_init_worker,
+            initargs=(model_config, str(device), os.getcwd()),
+            mp_context=multiprocessing.get_context("spawn"),
+        )
     replay_buffer = ReplayBuffer(args.buffer_size)
     run_id = timestamp_slug()
     start_iteration = 1
@@ -311,13 +365,16 @@ def train_command(args):
         model.load_state_dict(resumed_checkpoint["model_state_dict"])
         if "optimizer_state_dict" in resumed_checkpoint:
             optimizer.load_state_dict(resumed_checkpoint["optimizer_state_dict"])
-        if "scheduler_state_dict" in resumed_checkpoint:
+        if not args.reset_lr and "scheduler_state_dict" in resumed_checkpoint:
             scheduler.load_state_dict(resumed_checkpoint["scheduler_state_dict"])
+        if args.reset_lr:
+            for pg in optimizer.param_groups:
+                pg["lr"] = args.learning_rate
         start_iteration = int(resumed_checkpoint.get("iteration", 0)) + 1
         metadata = resumed_checkpoint.get("metadata", {})
         resumed_metrics_file = metadata.get("metrics_file")
         resumed_milestones = metadata.get("lr_milestones")
-        if args.lr_milestones is None and resumed_milestones:
+        if not args.reset_lr and args.lr_milestones is None and resumed_milestones:
             milestones = resumed_milestones
 
         buffer_path = args.resume.parent / "buffer.npz"
@@ -330,6 +387,15 @@ def train_command(args):
         eval_engine = chess.engine.SimpleEngine.popen_uci(str(args.eval_engine))
 
     draw_value = 2.0 * args.draw_score - 1.0
+    game_kwargs = {
+        "num_simulations": args.simulations,
+        "max_moves": args.max_moves,
+        "draw_value": draw_value,
+        "avoid_immediate_draws": not args.allow_immediate_draws,
+        "capture_reward_scale": args.capture_reward_scale,
+        "capture_reward_cap": args.capture_reward_cap,
+        "mcts_batch_size": args.mcts_batch_size,
+    }
     if args.metrics_file is not None:
         metrics_file = args.metrics_file
     elif resumed_metrics_file:
@@ -441,20 +507,23 @@ def train_command(args):
             print_title(f"Iteration {iteration}/{args.iterations}")
 
         game_times = []
-        for game_index in range(1, args.games_per_iteration + 1):
-            game_started_at = time.perf_counter()
-            samples, final_state, moves, result = self_play_game(
-                game=game,
-                net=model,
-                num_simulations=args.simulations,
-                max_moves=args.max_moves,
-                draw_value=draw_value,
-                avoid_immediate_draws=not args.allow_immediate_draws,
-                capture_reward_scale=args.capture_reward_scale,
-                capture_reward_cap=args.capture_reward_cap,
-                mcts_batch_size=args.mcts_batch_size,
-            )
-            game_elapsed = time.perf_counter() - game_started_at
+
+        if executor is not None:
+            state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+            futures = {
+                executor.submit(_run_worker_game, (state_dict, game_kwargs)): gi
+                for gi in range(1, args.games_per_iteration + 1)
+            }
+            games_source = ((futures[f], *f.result()) for f in as_completed(futures))
+        else:
+            def _seq():
+                for gi in range(1, args.games_per_iteration + 1):
+                    t0 = time.perf_counter()
+                    s, fs, mv, r = self_play_game(game=game, net=model, **game_kwargs)
+                    yield gi, s, fs, mv, r, time.perf_counter() - t0
+            games_source = _seq()
+
+        for game_index, samples, final_state, moves, result, game_elapsed in games_source:
             game_times.append(game_elapsed)
             replay_buffer.add_game(samples)
             iteration_samples += len(samples)
@@ -475,38 +544,34 @@ def train_command(args):
                     args.records_dir
                     / f"{run_id}_iter_{iteration:04d}_game_{game_index:02d}.pgn"
                 )
-                save_self_play_pgn(
-                    pgn_path,
-                    moves,
-                    result,
-                    iteration,
-                    game_index,
-                )
+                save_self_play_pgn(pgn_path, moves, result, iteration, game_index)
+
             metrics = None
             if eval_engine is not None and game_index <= args.eval_games:
                 eval_started_at = time.perf_counter()
                 try:
-                    metrics = evaluate_game_with_engine(
-                        eval_engine,
-                        moves,
-                        args.eval_time,
-                    )
+                    metrics = evaluate_game_with_engine(eval_engine, moves, args.eval_time)
                 except chess.engine.EngineError as exc:
                     print_kv("audit", [("game", game_index), ("skipped", exc)])
                 eval_elapsed = time.perf_counter() - eval_started_at
                 if metrics is not None:
                     engine_metrics.append(metrics)
 
-            avg_game_time = sum(game_times) / len(game_times)
-            remaining_games = args.games_per_iteration - game_index
-            eta_selfplay = remaining_games * avg_game_time
+            completed_count = len(game_times)
+            if executor is None:
+                avg_game_time = sum(game_times) / completed_count
+                eta_sp_str = format_duration(
+                    (args.games_per_iteration - completed_count) * avg_game_time
+                )
+            else:
+                eta_sp_str = "parallel"
 
             game_items = [
                 ("game", f"{game_index}/{args.games_per_iteration}"),
                 ("result", result),
                 ("pos", len(samples)),
                 ("speed", f"{len(samples) / max(game_elapsed, 1e-9):.1f} pos/s"),
-                ("eta_sp", format_duration(eta_selfplay)),
+                ("eta_sp", eta_sp_str),
             ]
             if pgn_path is not None:
                 game_items.append(("pgn", pgn_path.name))
@@ -744,6 +809,8 @@ def train_command(args):
             print_kv("stop", [("reason", "time limit reached after checkpoint")])
             break
 
+    if executor is not None:
+        executor.shutdown(wait=False)
     if eval_engine is not None:
         eval_engine.quit()
     if writer is not None:
