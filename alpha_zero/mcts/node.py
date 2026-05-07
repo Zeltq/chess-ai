@@ -1,7 +1,11 @@
 class Node:
     def __init__(self, state, prior=0.0, parent=None, action=None):
         self.state = state
-        self.prior = prior
+        self.prior = float(prior)
+        # Dirichlet noise mutates `prior` at the root every move; keep the
+        # un-mixed value so re-rooting can re-apply fresh noise without
+        # noise compounding across moves.
+        self.original_prior = float(prior)
         self.parent = parent
         self.action = action
         self.children = {}

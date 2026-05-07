@@ -29,7 +29,7 @@ class MCTS:
         self.dirichlet_epsilon = dirichlet_epsilon
         self.batch_size = batch_size
 
-    def run(self, game, state, net, num_simulations, add_exploration_noise=False):
+    def run(self, game, state, net, num_simulations, add_exploration_noise=False, root=None):
         # MCTS internal nodes use stack=False copies: full move history
         # (3-fold / 50-move detection) is unnecessary inside the tree and
         # would make late-game copies O(plies). Real game termination is
@@ -37,9 +37,12 @@ class MCTS:
         is_terminal_fast = getattr(game, "is_terminal_fast", game.is_terminal)
         get_reward_fast = getattr(game, "get_reward_fast", game.get_reward)
 
-        root = Node(_copy_fast(game, state))
         device = next(net.parameters()).device
-        self._expand_and_evaluate_batch([root], game, net, device)
+        if root is None:
+            root = Node(_copy_fast(game, state))
+            self._expand_and_evaluate_batch([root], game, net, device)
+        elif not root.expanded():
+            self._expand_and_evaluate_batch([root], game, net, device)
 
         if add_exploration_noise and root.children:
             self._add_dirichlet_noise(root)
@@ -141,9 +144,11 @@ class MCTS:
         noise = np.random.dirichlet(
             [self.dirichlet_alpha] * len(actions)
         )
+        # Re-mix from original_prior so noise does not compound across
+        # successive root re-uses in self-play.
         for action, sample in zip(actions, noise):
             child = root.children[action]
             child.prior = (
-                (1 - self.dirichlet_epsilon) * child.prior
+                (1 - self.dirichlet_epsilon) * child.original_prior
                 + self.dirichlet_epsilon * float(sample)
             )

@@ -113,19 +113,16 @@ def self_play_game(
     moves = []
     capture_rewards = []
     move_index = 0
+    current_root = None  # MCTS subtree carried over from the previous move.
 
     while not game.is_terminal(state) and (max_moves is None or move_index < max_moves):
-        # Mate-in-1 scanning was previously short-circuited here. Removed: it
-        # iterated all legal moves and copy/push'd a board for each, costing
-        # ~30 board copies per ply. MCTS finds mate-in-1 in a few simulations
-        # via the +1 terminal reward, so the scan was net-negative.
-
         root = mcts.run(
             game,
             state,
             net,
             num_simulations=num_simulations,
             add_exploration_noise=True,
+            root=current_root,
         )
 
         actions = np.array(list(root.children.keys()), dtype=np.int32)
@@ -164,6 +161,16 @@ def self_play_game(
         moves.append(move)
         capture_rewards.append((mover, captured_value))
         move_index += 1
+
+        # Tree reuse: the chosen child becomes the new root. It is guaranteed
+        # to be expanded (it had the highest sampled visit count, so MCTS
+        # selected it at least once and ran expand_and_evaluate on it).
+        next_root = root.children.get(action)
+        if next_root is not None and next_root.expanded():
+            next_root.parent = None
+            current_root = next_root
+        else:
+            current_root = None
 
     result = game.get_result(state)
     if result == "*":
