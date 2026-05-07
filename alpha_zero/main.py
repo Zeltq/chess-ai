@@ -34,10 +34,15 @@ def _init_worker(model_config, device_str, cwd):
         sys.path.insert(0, cwd)
     torch.set_num_threads(1)
     device = torch.device(device_str)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
     from env.chess_env import Chess as _Chess
     from model.net import AlphaZeroNet as _Net
     _worker_state["game"] = _Chess()
-    _worker_state["net"] = _Net(**model_config).to(device)
+    net = _Net(**model_config).to(device)
+    if device.type == "cuda":
+        net = net.to(memory_format=torch.channels_last)
+    _worker_state["net"] = net
 
 
 def _run_worker_game(args):
@@ -143,6 +148,25 @@ def parse_args():
 def create_model(device, model_config=None):
     config = model_config or {}
     model = AlphaZeroNet(**config).to(device)
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    return model
+
+
+def autocast_dtype(device):
+    if device.type != "cuda":
+        return torch.float32
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def maybe_compile(model, device):
+    """Compile only the forward method so state_dict / save / load stay simple."""
+    if device.type != "cuda":
+        return model
+    try:
+        model.forward = torch.compile(model.forward, mode="reduce-overhead", fullgraph=False)
+    except Exception as exc:
+        print_kv("compile", [("skipped", exc)])
     return model
 
 
@@ -320,6 +344,8 @@ def train_command(args):
         raise ValueError("--capture-reward-cap must be between 0 and 1")
 
     device = select_device()
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
     game = Chess()
 
     model_config = {
@@ -347,7 +373,13 @@ def train_command(args):
         optimizer, milestones=milestones, gamma=args.lr_decay_factor
     )
 
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    amp_dtype = autocast_dtype(device)
+    # bf16 has fp32 exponent range; no GradScaler needed. fp16 still needs it.
+    scaler = (
+        torch.amp.GradScaler("cuda")
+        if device.type == "cuda" and amp_dtype == torch.float16
+        else None
+    )
     executor = None
     if args.parallel_games > 1:
         import multiprocessing
@@ -381,6 +413,9 @@ def train_command(args):
         if buffer_path.exists():
             load_buffer(replay_buffer, buffer_path)
             print_kv("resume", [("buffer", f"{len(replay_buffer)} positions loaded from {buffer_path.name}")])
+
+    # Compile after weights are loaded so the first forward pass triggers compile on real shapes.
+    model = maybe_compile(model, device)
 
     eval_engine = None
     if args.eval_engine is not None:

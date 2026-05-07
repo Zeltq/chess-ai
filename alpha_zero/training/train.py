@@ -4,11 +4,22 @@ import torch
 def train_on_batch(net, optimizer, batch, device, scaler=None):
     states, policies, values = batch
     states = states.to(device)
+    if device.type == "cuda":
+        states = states.contiguous(memory_format=torch.channels_last)
     policies = policies.to(device)
     values = values.to(device)
 
+    if device.type == "cuda":
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        amp_dtype = torch.float32
+
     optimizer.zero_grad()
-    with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+    with torch.autocast(
+        device_type=device.type,
+        dtype=amp_dtype,
+        enabled=device.type == "cuda",
+    ):
         predicted_policies, predicted_values = net(states)
         value_loss = torch.mean((predicted_values.float() - values) ** 2)
         log_probs = torch.log_softmax(predicted_policies.float(), dim=1)

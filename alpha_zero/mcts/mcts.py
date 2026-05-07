@@ -61,8 +61,17 @@ class MCTS:
 
     def _expand_and_evaluate_batch(self, nodes, game, net, device):
         state_tensors = torch.stack([game.encode_state(n.state) for n in nodes]).to(device)
+        if device.type == "cuda":
+            state_tensors = state_tensors.contiguous(memory_format=torch.channels_last)
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            amp_dtype = torch.float32
         with torch.inference_mode():
-            with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=device.type == "cuda",
+            ):
                 policy_logits_batch, values_batch = net(state_tensors)
 
         policies = torch.softmax(policy_logits_batch.float(), dim=-1).cpu().numpy()
