@@ -76,6 +76,11 @@ def parse_args():
         help="Leaves evaluated per NN forward pass in MCTS. Higher = better GPU utilization.",
     )
     train_parser.add_argument(
+        "--fpu-reduction", type=float, default=0.25,
+        help="First-Play Urgency reduction. Estimated Q for unvisited children "
+             "is parent.value - fpu_reduction. Set 0 for the legacy Q=0 behavior.",
+    )
+    train_parser.add_argument(
         "--parallel-games", type=int, default=1,
         help="Number of self-play games to run in parallel as Python threads "
              "sharing one GPU model via the InferenceServer. Default 1 = "
@@ -418,6 +423,7 @@ def train_command(args):
         "capture_reward_scale": args.capture_reward_scale,
         "capture_reward_cap": args.capture_reward_cap,
         "mcts_batch_size": args.mcts_batch_size,
+        "fpu_reduction": args.fpu_reduction,
     }
     if args.metrics_file is not None:
         metrics_file = args.metrics_file

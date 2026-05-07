@@ -23,11 +23,22 @@ def _step_fast(game, state, action):
 
 
 class MCTS:
-    def __init__(self, c_puct=1.5, dirichlet_alpha=0.3, dirichlet_epsilon=0.25, batch_size=8):
+    def __init__(
+        self,
+        c_puct=1.5,
+        dirichlet_alpha=0.3,
+        dirichlet_epsilon=0.25,
+        batch_size=8,
+        fpu_reduction=0.25,
+    ):
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
         self.batch_size = batch_size
+        # First-Play Urgency: estimated Q for an unvisited child = parent.value
+        # minus this constant. With fpu_reduction=0 we revert to "Q=0", i.e.
+        # neutral, which over-explores unvisited siblings of strong children.
+        self.fpu_reduction = fpu_reduction
 
     def run(self, game, state, evaluator, num_simulations, add_exploration_noise=False, root=None):
         """Run MCTS with the given evaluator.
@@ -119,11 +130,20 @@ class MCTS:
 
         parent_visits = max(1, node.visit_count)
         sqrt_parent_visits = math.sqrt(parent_visits)
+        # Q-floor for unvisited children. Parent.value is from parent's STM POV;
+        # we assume an unvisited child is slightly worse than the parent's
+        # current expectation.
+        fpu_q = node.value - self.fpu_reduction
 
         for action, child in node.children.items():
-            score = -child.value + self.c_puct * child.prior * (
+            if child.visit_count == 0:
+                q = fpu_q
+            else:
+                q = -child.value
+            u = self.c_puct * child.prior * (
                 sqrt_parent_visits / (1 + child.visit_count)
             )
+            score = q + u
             if score > best_score:
                 best_score = score
                 best_action = action
