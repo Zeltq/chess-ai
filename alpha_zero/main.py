@@ -57,6 +57,13 @@ def parse_args():
              "materialism in the long run, so it ramps off.",
     )
     train_parser.add_argument("--buffer-size", type=int, default=50000)
+    train_parser.add_argument(
+        "--mirror-augment", action="store_true",
+        help="Augment training samples with horizontal-mirror copies (50%% "
+             "chance per sample). Effectively doubles data diversity but "
+             "introduces small distribution shift on positions with castling "
+             "rights, since chess geometry is not perfectly file-symmetric.",
+    )
     train_parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
     train_parser.add_argument("--records-dir", type=Path, default=Path("games"))
     train_parser.add_argument("--metrics-dir", type=Path, default=Path("metrics"))
@@ -387,7 +394,7 @@ def train_command(args):
             max_workers=args.parallel_games,
             thread_name_prefix="selfplay",
         )
-    replay_buffer = ReplayBuffer(args.buffer_size)
+    replay_buffer = ReplayBuffer(args.buffer_size, mirror_augment=args.mirror_augment)
     run_id = timestamp_slug()
     start_iteration = 1
     resumed_metrics_file = None
