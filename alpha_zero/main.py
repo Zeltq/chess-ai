@@ -1,8 +1,9 @@
 import argparse
 import csv
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 import math
+import multiprocessing as mp
+import os
 from pathlib import Path
 import time
 
@@ -19,7 +20,60 @@ from training.buffer import ReplayBuffer
 from training.self_play import find_immediate_checkmate_action, self_play_game
 from training.train import build_batch, train_on_batch
 from mcts.mcts import MCTS
-from mcts.inference import InferenceServer, LocalEvaluator
+from mcts.inference import (
+    LocalEvaluator,
+    MPInferenceClient,
+    MPInferenceServer,
+)
+
+
+def _selfplay_worker(
+    worker_id, request_queue, response_queue,
+    job_queue, result_queue, base_game_kwargs, seed, cwd,
+):
+    """Worker process for parallel self-play.
+
+    Each worker runs an independent MCTS over CPU; inference goes through
+    a process-shared GPU server in the main process. Workers stay alive
+    across iterations and pull jobs from `job_queue`. A None job is the
+    shutdown sentinel.
+    """
+    import sys
+    os.chdir(cwd)
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+    import random as _random
+    if seed is not None:
+        _random.seed(seed + worker_id)
+        np.random.seed(seed + worker_id)
+        torch.manual_seed(seed + worker_id)
+    torch.set_num_threads(1)
+
+    from env.chess_env import Chess as _Chess
+    from training.self_play import self_play_game as _spg
+
+    game = _Chess()
+    evaluator = MPInferenceClient(worker_id, request_queue, response_queue)
+
+    while True:
+        job = job_queue.get()
+        if job is None:
+            break
+        game_id, capture_reward_scale = job
+        kwargs = dict(base_game_kwargs)
+        kwargs["capture_reward_scale"] = capture_reward_scale
+        t0 = time.perf_counter()
+        try:
+            samples, final_state, moves, result, stats = _spg(
+                game=game, evaluator=evaluator, **kwargs,
+            )
+        except Exception as exc:  # surface failures rather than hang the queue
+            result_queue.put((game_id, None, None, None, None, None, 0.0, repr(exc)))
+            continue
+        elapsed = time.perf_counter() - t0
+        result_queue.put(
+            (game_id, samples, final_state, moves, result, stats, elapsed, None)
+        )
 
 
 def parse_args():
@@ -397,24 +451,31 @@ def train_command(args):
         if device.type == "cuda" and amp_dtype == torch.float16
         else None
     )
-    # Self-play parallelism: when parallel-games > 1 we run a single GPU
-    # model + an InferenceServer in the main process, and spawn a thread
-    # pool of MCTS workers. Each worker is a Python thread; the GIL is
-    # released during chess.Board operations (C extension) and during
-    # torch GPU forwards, so threads make progress concurrently.
+    # Self-play parallelism: each worker game runs in its own *process*,
+    # which sidesteps Python's GIL. Inference is centralized in the main
+    # process via MPInferenceServer; workers ship encoded states over a
+    # multiprocessing.Queue and block on per-worker response queues.
     inference_server = None
-    selfplay_pool = None
+    mp_workers = []
+    mp_request_queue = None
+    mp_response_queues = None
+    mp_job_queue = None
+    mp_result_queue = None
     if args.parallel_games > 1:
-        if device.type == "cuda":
-            inference_server = InferenceServer(
-                model,
-                device,
-                max_batch_size=args.server_batch_size,
-                max_wait_seconds=args.server_max_wait_ms / 1000.0,
-            )
-        selfplay_pool = ThreadPoolExecutor(
-            max_workers=args.parallel_games,
-            thread_name_prefix="selfplay",
+        ctx = mp.get_context("spawn")
+        mp_request_queue = ctx.Queue()
+        mp_response_queues = [ctx.Queue() for _ in range(args.parallel_games)]
+        mp_job_queue = ctx.Queue()
+        mp_result_queue = ctx.Queue()
+        # Server starts now so the spawned workers can immediately push
+        # requests as soon as they finish initialising.
+        inference_server = MPInferenceServer(
+            model,
+            device,
+            mp_request_queue,
+            mp_response_queues,
+            max_batch_size=args.server_batch_size,
+            max_wait_seconds=args.server_max_wait_ms / 1000.0,
         )
     replay_buffer = ReplayBuffer(args.buffer_size, mirror_augment=args.mirror_augment)
     run_id = timestamp_slug()
@@ -592,22 +653,48 @@ def train_command(args):
 
         game_times = []
 
-        # Shared model is the source of truth. Server reads its parameters
-        # (in place) every batch, so weight updates from training propagate
-        # automatically without any state_dict broadcast.
-        evaluator = inference_server if inference_server is not None else local_evaluator
+        # Lazily start workers on the first iteration that uses them so the
+        # initial spawn cost (numba JIT, torch import) overlaps with iter 1
+        # only and not with arg parsing.
+        if mp_request_queue is not None and not mp_workers:
+            for wid in range(args.parallel_games):
+                p = mp.get_context("spawn").Process(
+                    target=_selfplay_worker,
+                    args=(
+                        wid,
+                        mp_request_queue,
+                        mp_response_queues[wid],
+                        mp_job_queue,
+                        mp_result_queue,
+                        game_kwargs,
+                        args.seed,
+                        os.getcwd(),
+                    ),
+                    daemon=False,
+                )
+                p.start()
+                mp_workers.append(p)
 
-        if selfplay_pool is not None:
-            def _run_one(gi):
-                t0 = time.perf_counter()
-                s, fs, mv, r, st = self_play_game(game=game, evaluator=evaluator, **game_kwargs)
-                return gi, s, fs, mv, r, st, time.perf_counter() - t0
-            futures = [
-                selfplay_pool.submit(_run_one, gi)
-                for gi in range(1, args.games_per_iteration + 1)
-            ]
-            games_source = (f.result() for f in as_completed(futures))
+        if mp_request_queue is not None:
+            # Dispatch this iteration's games. capture_reward_scale rides on
+            # the job tuple so the per-iter ramp value reaches workers without
+            # any state broadcast.
+            scale = game_kwargs["capture_reward_scale"]
+            for gi in range(1, args.games_per_iteration + 1):
+                mp_job_queue.put((gi, scale))
+
+            def _drain():
+                completed = 0
+                while completed < args.games_per_iteration:
+                    item = mp_result_queue.get()
+                    completed += 1
+                    game_id, samples, final_state, moves, result, st, elapsed, exc = item
+                    if exc is not None:
+                        raise RuntimeError(f"worker game {game_id} failed: {exc}")
+                    yield game_id, samples, final_state, moves, result, st, elapsed
+            games_source = _drain()
         else:
+            evaluator = local_evaluator
             def _seq():
                 for gi in range(1, args.games_per_iteration + 1):
                     t0 = time.perf_counter()
@@ -657,7 +744,7 @@ def train_command(args):
                     engine_metrics.append(metrics)
 
             completed_count = len(game_times)
-            if selfplay_pool is None:
+            if mp_request_queue is None:
                 avg_game_time = sum(game_times) / completed_count
                 eta_sp_str = format_duration(
                     (args.games_per_iteration - completed_count) * avg_game_time
@@ -941,8 +1028,14 @@ def train_command(args):
             print_kv("stop", [("reason", "time limit reached after checkpoint")])
             break
 
-    if selfplay_pool is not None:
-        selfplay_pool.shutdown(wait=True)
+    if mp_workers:
+        # Send shutdown sentinels and join workers cleanly.
+        for _ in mp_workers:
+            mp_job_queue.put(None)
+        for p in mp_workers:
+            p.join(timeout=30)
+            if p.is_alive():
+                p.terminate()
     if inference_server is not None:
         inference_server.stop()
     if eval_engine is not None:
