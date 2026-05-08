@@ -95,8 +95,13 @@ def self_play_game(
     capture_rewards = []
     move_index = 0
     current_root = None  # MCTS subtree carried over from the previous move.
+    reused_visits_total = 0
+    reused_visits_moves = 0
 
     while not game.is_terminal(state) and (max_moves is None or move_index < max_moves):
+        if current_root is not None:
+            reused_visits_total += current_root.visit_count
+            reused_visits_moves += 1
         root = mcts.run(
             game,
             state,
@@ -114,10 +119,14 @@ def self_play_game(
         policy_target[actions] = visit_probs
 
         # Reuse the encoded tensor MCTS already produced for the root —
-        # avoids encoding the same position twice per move.
+        # avoids encoding the same position twice per move. Stored as
+        # numpy so downstream consumers (replay buffer, mirror augment,
+        # IPC) all see the same type.
         encoded_state = root.encoded_state
         if encoded_state is None:
             encoded_state = game.encode_state(state)
+        if hasattr(encoded_state, "numpy"):
+            encoded_state = encoded_state.numpy()
         history.append(
             {
                 "state": encoded_state,
@@ -171,4 +180,12 @@ def self_play_game(
         value = float(np.clip(value + capture_bonus, -1.0, 1.0))
         samples.append((item["state"], item["policy"], value))
 
-    return samples, state, moves, result
+    stats = {
+        "moves": move_index,
+        "reused_visits_avg": (
+            reused_visits_total / reused_visits_moves
+            if reused_visits_moves > 0 else 0.0
+        ),
+        "reused_visits_moves": reused_visits_moves,
+    }
+    return samples, state, moves, result, stats

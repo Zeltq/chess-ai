@@ -600,8 +600,8 @@ def train_command(args):
         if selfplay_pool is not None:
             def _run_one(gi):
                 t0 = time.perf_counter()
-                s, fs, mv, r = self_play_game(game=game, evaluator=evaluator, **game_kwargs)
-                return gi, s, fs, mv, r, time.perf_counter() - t0
+                s, fs, mv, r, st = self_play_game(game=game, evaluator=evaluator, **game_kwargs)
+                return gi, s, fs, mv, r, st, time.perf_counter() - t0
             futures = [
                 selfplay_pool.submit(_run_one, gi)
                 for gi in range(1, args.games_per_iteration + 1)
@@ -611,11 +611,18 @@ def train_command(args):
             def _seq():
                 for gi in range(1, args.games_per_iteration + 1):
                     t0 = time.perf_counter()
-                    s, fs, mv, r = self_play_game(game=game, evaluator=evaluator, **game_kwargs)
-                    yield gi, s, fs, mv, r, time.perf_counter() - t0
+                    s, fs, mv, r, st = self_play_game(game=game, evaluator=evaluator, **game_kwargs)
+                    yield gi, s, fs, mv, r, st, time.perf_counter() - t0
             games_source = _seq()
 
-        for game_index, samples, final_state, moves, result, game_elapsed in games_source:
+        iteration_reused_total = 0.0
+        iteration_reused_moves = 0
+
+        for (
+            game_index, samples, final_state, moves, result, game_stats, game_elapsed
+        ) in games_source:
+            iteration_reused_total += game_stats["reused_visits_avg"] * game_stats["reused_visits_moves"]
+            iteration_reused_moves += game_stats["reused_visits_moves"]
             game_times.append(game_elapsed)
             replay_buffer.add_game(samples)
             iteration_samples += len(samples)
@@ -694,17 +701,30 @@ def train_command(args):
                 writer.add_scalar("selfplay/game_moves", len(moves), global_game)
                 writer.flush()
 
-        print_kv(
-            "summary",
-            [
-                ("positions", iteration_samples),
-                ("buffer", len(replay_buffer)),
-                (
-                    "W/B/D",
-                    f"{results['white_wins']}/{results['black_wins']}/{results['draws']}",
-                ),
-            ],
-        )
+        summary_items = [
+            ("positions", iteration_samples),
+            ("buffer", len(replay_buffer)),
+            (
+                "W/B/D",
+                f"{results['white_wins']}/{results['black_wins']}/{results['draws']}",
+            ),
+        ]
+        if iteration_reused_moves > 0:
+            summary_items.append(
+                ("reused_v",
+                 f"{iteration_reused_total / iteration_reused_moves:.1f}")
+            )
+        if inference_server is not None:
+            ifs = inference_server.stats_and_reset()
+            if ifs["batches"] > 0:
+                summary_items.append(("ifs_batch", f"{ifs['avg_batch']:.0f}"))
+                summary_items.append(("ifs_max", str(ifs["max_batch"])))
+            # Side effect: by reading we reset, so the per-iter window is clean.
+            # Stash for the writer block below.
+            self_play_inference_stats = ifs
+        else:
+            self_play_inference_stats = None
+        print_kv("summary", summary_items)
         if engine_metrics:
             avg_accuracy = sum(
                 metric["avg_accuracy"] for metric in engine_metrics
@@ -863,6 +883,28 @@ def train_command(args):
                 writer.add_scalar("audit/accuracy", avg_accuracy, iteration)
             if avg_cp_loss is not None:
                 writer.add_scalar("audit/cp_loss", avg_cp_loss, iteration)
+            if iteration_reused_moves > 0:
+                writer.add_scalar(
+                    "mcts/avg_reused_visits",
+                    iteration_reused_total / iteration_reused_moves,
+                    iteration,
+                )
+            if self_play_inference_stats is not None and self_play_inference_stats["batches"] > 0:
+                writer.add_scalar(
+                    "inference/avg_batch_size",
+                    self_play_inference_stats["avg_batch"],
+                    iteration,
+                )
+                writer.add_scalar(
+                    "inference/max_batch_size",
+                    self_play_inference_stats["max_batch"],
+                    iteration,
+                )
+                writer.add_scalar(
+                    "inference/positions_per_iter",
+                    self_play_inference_stats["positions"],
+                    iteration,
+                )
             writer.flush()
 
         append_metrics_row(
