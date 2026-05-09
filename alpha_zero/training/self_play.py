@@ -23,6 +23,15 @@ def _sample_action(actions, probabilities, temperature):
     return int(np.random.choice(actions, p=scaled))
 
 
+def _material_balance(state):
+    """Material differential from White's perspective, in pawn units."""
+    balance = 0.0
+    for _, piece in state.piece_map().items():
+        v = PIECE_VALUES.get(piece.piece_type, 0.0)
+        balance += v if piece.color == chess.WHITE else -v
+    return balance
+
+
 def find_immediate_checkmate_action(game, state):
     for move in state.legal_moves:
         next_state = game.copy_state(state)
@@ -81,6 +90,9 @@ def self_play_game(
     fpu_reduction=0.25,
     c_puct_base=None,
     c_puct_init=1.25,
+    adjudicate_material=None,
+    adjudicate_min_move=40,
+    adjudicate_consecutive=3,
 ):
     mcts = MCTS(
         c_puct=c_puct,
@@ -97,6 +109,14 @@ def self_play_game(
     current_root = None  # MCTS subtree carried over from the previous move.
     reused_visits_total = 0
     reused_visits_moves = 0
+    # Material adjudication: ends the game with a decisive result if one side
+    # has held a material lead of at least `adjudicate_material` pawn units
+    # for `adjudicate_consecutive` plies after move `adjudicate_min_move`.
+    # Bootstraps win/loss signal in early training when MCTS would otherwise
+    # draw everything by repetition.
+    adjudicated_result = None  # "1-0" / "0-1" / None
+    material_streak = 0
+    last_streak_sign = 0
 
     while not game.is_terminal(state) and (max_moves is None or move_index < max_moves):
         if current_root is not None:
@@ -156,14 +176,52 @@ def self_play_game(
         else:
             current_root = None
 
-    result = game.get_result(state)
-    if result == "*":
-        result = "1/2-1/2"
-    outcome = state.outcome(claim_draw=True)
-    if outcome is not None and outcome.winner is not None:
-        white_outcome = 1.0 if outcome.winner else -1.0
+        # Material-balance adjudication. Tracks consecutive plies where the
+        # signed material lead exceeds the threshold; firing breaks the loop
+        # with a decisive result.
+        if (
+            adjudicate_material is not None
+            and move_index >= adjudicate_min_move
+        ):
+            balance = _material_balance(state)
+            if balance >= adjudicate_material:
+                sign = 1
+            elif balance <= -adjudicate_material:
+                sign = -1
+            else:
+                sign = 0
+            if sign != 0 and sign == last_streak_sign:
+                material_streak += 1
+            elif sign != 0:
+                material_streak = 1
+                last_streak_sign = sign
+            else:
+                material_streak = 0
+                last_streak_sign = 0
+            if material_streak >= adjudicate_consecutive:
+                adjudicated_result = "1-0" if last_streak_sign > 0 else "0-1"
+                break
+        else:
+            current_root = None
+
+    # Adjudication overrides natural outcome detection: we end the game
+    # decisively even though python-chess sees an in-progress (or drawable)
+    # position. value targets follow the adjudicated winner.
+    if adjudicated_result is not None:
+        result = adjudicated_result
+        white_outcome = 1.0 if adjudicated_result == "1-0" else -1.0
+        decisive = True
     else:
-        white_outcome = draw_value
+        result = game.get_result(state)
+        if result == "*":
+            result = "1/2-1/2"
+        outcome = state.outcome(claim_draw=True)
+        if outcome is not None and outcome.winner is not None:
+            white_outcome = 1.0 if outcome.winner else -1.0
+            decisive = True
+        else:
+            white_outcome = draw_value
+            decisive = False
 
     samples = []
     capture_bonuses = _future_capture_bonus(
@@ -173,7 +231,7 @@ def self_play_game(
         capture_reward_cap,
     )
     for item, capture_bonus in zip(history, capture_bonuses):
-        if outcome is not None and outcome.winner is not None:
+        if decisive:
             value = white_outcome if item["player"] == chess.WHITE else -white_outcome
         else:
             value = draw_value
@@ -187,5 +245,6 @@ def self_play_game(
             if reused_visits_moves > 0 else 0.0
         ),
         "reused_visits_moves": reused_visits_moves,
+        "adjudicated": adjudicated_result is not None,
     }
     return samples, state, moves, result, stats

@@ -151,6 +151,16 @@ def parse_args():
         help="Half-move index after which temperature drops to 0 (greedy).",
     )
     train_parser.add_argument(
+        "--adjudicate-material", type=float, default=None,
+        help="Material lead (in pawn units) that triggers a decisive result "
+             "if held for --adjudicate-consecutive plies after move "
+             "--adjudicate-min-move. Bootstraps win/loss signal in early "
+             "training when MCTS would otherwise draw everything by "
+             "repetition. Recommended: 5.0. None disables.",
+    )
+    train_parser.add_argument("--adjudicate-min-move", type=int, default=40)
+    train_parser.add_argument("--adjudicate-consecutive", type=int, default=3)
+    train_parser.add_argument(
         "--c-puct-base", type=float, default=None,
         help="Enable AlphaZero log-c_puct: c(N) = log((1+N+base)/base) + init. "
              "Recommended only with high simulation counts; default disables.",
@@ -527,6 +537,9 @@ def train_command(args):
         "temperature_drop_move": args.temperature_drop_move,
         "c_puct_base": args.c_puct_base,
         "c_puct_init": args.c_puct_init,
+        "adjudicate_material": args.adjudicate_material,
+        "adjudicate_min_move": args.adjudicate_min_move,
+        "adjudicate_consecutive": args.adjudicate_consecutive,
     }
     if args.metrics_file is not None:
         metrics_file = args.metrics_file
