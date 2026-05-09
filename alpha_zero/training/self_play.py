@@ -15,6 +15,43 @@ PIECE_VALUES = {
 CAPTURE_REWARD_DISCOUNT = 0.98
 
 
+# Endgame curriculum: a pool of starting positions that force the model to
+# learn mating technique. From scratch, self-play almost never reaches these
+# positions (games end earlier by adjudication / 50-move / max_moves), so
+# the model never learns to checkmate K+R vs K, K+Q vs K, etc.
+# When --endgame-curriculum > 0, each self-play game starts from a sampled
+# position from this list with the given probability. Adjudication is
+# disabled for these games — the model must actually deliver checkmate
+# (or accept a draw by 50-move / stalemate / max_moves).
+ENDGAME_STARTING_FENS = [
+    # --- K+Q vs K (easiest — ~10 moves to mate) ---
+    "8/8/8/4k3/8/8/8/3QK3 w - - 0 1",
+    "4k3/8/8/8/8/8/8/Q3K3 w - - 0 1",
+    "8/4k3/8/8/8/8/4Q3/4K3 w - - 0 1",
+    # Black side variants
+    "3qk3/8/8/8/4K3/8/8/8 b - - 0 1",
+    "q3k3/8/8/8/8/8/8/4K3 b - - 0 1",
+    # --- K+R vs K (~15-20 moves; the famous test) ---
+    "8/8/8/4k3/8/8/8/3RK3 w - - 0 1",
+    "4k3/8/8/8/8/8/8/R3K3 w - - 0 1",
+    "8/4k3/8/8/8/8/4R3/4K3 w - - 0 1",
+    "3rk3/8/8/8/4K3/8/8/8 b - - 0 1",
+    "r3k3/8/8/8/8/8/8/4K3 b - - 0 1",
+    # --- K + 2R vs K (gateway, easier than K+R) ---
+    "8/8/8/4k3/8/8/R7/3RK3 w - - 0 1",
+    # --- K + P vs K endgames (square rule, opposition) ---
+    "4k3/8/8/8/8/4P3/8/4K3 w - - 0 1",
+    "4k3/8/8/4P3/8/8/8/4K3 w - - 0 1",
+    "8/4k3/8/4P3/4K3/8/8/8 w - - 0 1",
+    # K + Pawn race
+    "8/4k3/8/8/8/8/P7/4K3 w - - 0 1",
+    # Two pawns vs K
+    "4k3/8/8/8/4P3/4P3/8/4K3 w - - 0 1",
+    # --- K + 2Q vs K + Q (queen technique with counterplay) ---
+    "8/8/8/4k3/4q3/8/8/Q2QK3 w - - 0 1",
+]
+
+
 def _sample_action(actions, probabilities, temperature):
     if temperature <= 1e-6:
         return int(actions[np.argmax(probabilities)])
@@ -93,6 +130,7 @@ def self_play_game(
     adjudicate_material=None,
     adjudicate_min_move=40,
     adjudicate_consecutive=3,
+    endgame_curriculum=0.0,
 ):
     mcts = MCTS(
         c_puct=c_puct,
@@ -101,7 +139,28 @@ def self_play_game(
         c_puct_base=c_puct_base,
         c_puct_init=c_puct_init,
     )
-    state = game.get_initial_state()
+
+    # Endgame curriculum: with probability `endgame_curriculum` start from a
+    # sampled endgame position. Adjudication is disabled for these games so
+    # the model is forced to actually deliver checkmate (otherwise the game
+    # ends in a draw via 50-move / max_moves and the value target reflects
+    # that — useful negative signal for "you had advantage but didn't win").
+    started_from_endgame = (
+        endgame_curriculum > 0.0
+        and np.random.random() < endgame_curriculum
+    )
+    if started_from_endgame:
+        fen = ENDGAME_STARTING_FENS[
+            np.random.randint(0, len(ENDGAME_STARTING_FENS))
+        ]
+        state = chess.Board(fen)
+        # Disable adjudication for this game — force the model to actually
+        # deliver mate; otherwise it never learns the technique.
+        effective_adjudicate_material = None
+    else:
+        state = game.get_initial_state()
+        effective_adjudicate_material = adjudicate_material
+
     history = []
     moves = []
     capture_rewards = []
@@ -180,13 +239,13 @@ def self_play_game(
         # signed material lead exceeds the threshold; firing breaks the loop
         # with a decisive result.
         if (
-            adjudicate_material is not None
+            effective_adjudicate_material is not None
             and move_index >= adjudicate_min_move
         ):
             balance = _material_balance(state)
-            if balance >= adjudicate_material:
+            if balance >= effective_adjudicate_material:
                 sign = 1
-            elif balance <= -adjudicate_material:
+            elif balance <= -effective_adjudicate_material:
                 sign = -1
             else:
                 sign = 0
@@ -246,5 +305,6 @@ def self_play_game(
         ),
         "reused_visits_moves": reused_visits_moves,
         "adjudicated": adjudicated_result is not None,
+        "endgame_curriculum": started_from_endgame,
     }
     return samples, state, moves, result, stats

@@ -161,6 +161,15 @@ def parse_args():
     train_parser.add_argument("--adjudicate-min-move", type=int, default=40)
     train_parser.add_argument("--adjudicate-consecutive", type=int, default=3)
     train_parser.add_argument(
+        "--endgame-curriculum", type=float, default=0.0,
+        help="Probability (0..1) that a self-play game starts from a sampled "
+             "endgame position (K+R vs K, K+Q vs K, K+P endgames, etc.) "
+             "instead of the standard initial position. Adjudication is "
+             "disabled for these games — the model must actually deliver "
+             "checkmate. Bootstraps endgame technique that is otherwise "
+             "rarely encountered. Recommended: 0.2-0.3.",
+    )
+    train_parser.add_argument(
         "--c-puct-base", type=float, default=None,
         help="Enable AlphaZero log-c_puct: c(N) = log((1+N+base)/base) + init. "
              "Recommended only with high simulation counts; default disables.",
@@ -540,6 +549,7 @@ def train_command(args):
         "adjudicate_material": args.adjudicate_material,
         "adjudicate_min_move": args.adjudicate_min_move,
         "adjudicate_consecutive": args.adjudicate_consecutive,
+        "endgame_curriculum": args.endgame_curriculum,
     }
     if args.metrics_file is not None:
         metrics_file = args.metrics_file
@@ -1335,24 +1345,35 @@ def pgn_viewer_command(args):
 
 
 class ChessGUI:
-    light_square = "#f0d9b5"
-    dark_square = "#b58863"
-    selected_square = "#f6f669"
-    legal_square = "#a9d18e"
-    pieces = {
-        "P": "♙",
-        "N": "♘",
-        "B": "♗",
-        "R": "♖",
-        "Q": "♕",
-        "K": "♔",
-        "p": "♟",
-        "n": "♞",
-        "b": "♝",
-        "r": "♜",
-        "q": "♛",
-        "k": "♚",
+    LIGHT = "#ebecd0"
+    DARK = "#779556"
+    LAST_LIGHT = "#f6f669"
+    LAST_DARK = "#baca44"
+    SELECT_LIGHT = "#f7ec74"
+    SELECT_DARK = "#dac34b"
+    DOT = "#3a3a3a"
+    BG = "#312e2b"
+    PANEL_BG = "#262421"
+    PANEL_ACCENT = "#3d3a37"
+    PANEL_FG = "#e8e6e3"
+    PANEL_HIGHLIGHT = "#779556"
+
+    SQ = 72
+    MARGIN = 10
+    BOARD_PX = SQ * 8 + 2 * MARGIN
+
+    GLYPH = {
+        chess.PAWN: "♟",
+        chess.KNIGHT: "♞",
+        chess.BISHOP: "♝",
+        chess.ROOK: "♜",
+        chess.QUEEN: "♛",
+        chess.KING: "♚",
     }
+    WHITE_FILL = "#ffffff"
+    WHITE_OUTLINE = "#000000"
+    BLACK_FILL = "#1a1a1a"
+    BLACK_OUTLINE = "#ffffff"
 
     def __init__(self, args):
         import tkinter as tk
@@ -1370,108 +1391,317 @@ class ChessGUI:
         self.board = self.game.get_initial_state()
         self.human_color = chess.WHITE if args.color == "white" else chess.BLACK
         self.simulations = args.simulations
-        self.selected = None
 
-        self.root = self.tk.Tk()
+        self.selected = None
+        self.san_history = []
+        # 0..len(move_stack); index of half-moves to display. Equal to live
+        # length means "show current position".
+        self.view_index = 0
+        self.thinking = False
+
+        self.root = tk.Tk()
         self.root.title(
             f"AlphaZero Chess - iteration {self.checkpoint.get('iteration', '?')}"
         )
-        self.status = tk.StringVar()
-        self.buttons = {}
+        self.root.configure(bg=self.BG)
 
-        board_frame = self.tk.Frame(self.root)
-        board_frame.pack(padx=12, pady=12)
-        for row in range(8):
-            for col in range(8):
-                button = self.tk.Button(
-                    board_frame,
-                    width=4,
-                    height=2,
-                    font=("Arial", 28),
-                    command=lambda r=row, c=col: self.on_square_click(r, c),
-                )
-                button.grid(row=row, column=col)
-                self.buttons[(row, col)] = button
+        outer = tk.Frame(self.root, bg=self.BG)
+        outer.pack(padx=12, pady=12)
 
-        self.tk.Label(self.root, textvariable=self.status, font=("Arial", 12)).pack(
-            padx=12, pady=(0, 12)
+        self.canvas = tk.Canvas(
+            outer,
+            width=self.BOARD_PX,
+            height=self.BOARD_PX,
+            bg=self.BG,
+            highlightthickness=0,
         )
+        self.canvas.grid(row=0, column=0, padx=(0, 12))
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+
+        side = tk.Frame(outer, bg=self.PANEL_BG)
+        side.grid(row=0, column=1, sticky="ns")
+        tk.Label(
+            side, text="Moves",
+            bg=self.PANEL_BG, fg=self.PANEL_FG,
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        list_frame = tk.Frame(side, bg=self.PANEL_BG)
+        list_frame.pack(padx=10, fill="both", expand=True)
+        self.move_listbox = tk.Listbox(
+            list_frame,
+            width=20, height=18,
+            bg=self.PANEL_ACCENT, fg=self.PANEL_FG,
+            selectbackground=self.PANEL_HIGHLIGHT,
+            selectforeground="#ffffff",
+            highlightthickness=0, borderwidth=0, activestyle="none",
+            exportselection=False,
+            font=("Consolas", 11),
+        )
+        scroll = tk.Scrollbar(
+            list_frame, orient="vertical",
+            command=self.move_listbox.yview,
+        )
+        self.move_listbox.configure(yscrollcommand=scroll.set)
+        self.move_listbox.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.move_listbox.bind("<<ListboxSelect>>", self.on_move_listbox_select)
+
+        nav = tk.Frame(side, bg=self.PANEL_BG)
+        nav.pack(pady=10)
+        for label, cmd in [
+            ("⏮", self.go_start),
+            ("◀", self.go_back),
+            ("▶", self.go_forward),
+            ("⏭", self.go_end),
+        ]:
+            tk.Button(
+                nav, text=label, width=3,
+                bg=self.PANEL_ACCENT, fg=self.PANEL_FG,
+                activebackground=self.PANEL_HIGHLIGHT,
+                activeforeground="#ffffff",
+                relief="flat", borderwidth=0,
+                font=("Segoe UI", 12, "bold"),
+                command=cmd,
+            ).pack(side="left", padx=2)
+
+        self.status = tk.StringVar()
+        tk.Label(
+            self.root, textvariable=self.status,
+            bg=self.BG, fg=self.PANEL_FG, font=("Segoe UI", 11),
+        ).pack(padx=12, pady=(0, 12))
+
+        self.root.bind("<Left>", lambda e: self.go_back())
+        self.root.bind("<Right>", lambda e: self.go_forward())
+        self.root.bind("<Home>", lambda e: self.go_start())
+        self.root.bind("<End>", lambda e: self.go_end())
+
         self.render()
         self.root.after(250, self.maybe_model_move)
 
     def run(self):
         self.root.mainloop()
 
-    def row_col_to_square(self, row, col):
+    def _square_to_rc(self, square):
+        f = chess.square_file(square)
+        r = chess.square_rank(square)
+        if self.human_color == chess.WHITE:
+            return 7 - r, f
+        return r, 7 - f
+
+    def _xy_to_square(self, x, y):
+        col = (x - self.MARGIN) // self.SQ
+        row = (y - self.MARGIN) // self.SQ
+        if not (0 <= col < 8 and 0 <= row < 8):
+            return None
+        col = int(col)
+        row = int(row)
         if self.human_color == chess.WHITE:
             return chess.square(col, 7 - row)
         return chess.square(7 - col, row)
 
-    def square_to_row_col(self, square):
-        file_idx = chess.square_file(square)
-        rank_idx = chess.square_rank(square)
-        if self.human_color == chess.WHITE:
-            return 7 - rank_idx, file_idx
-        return rank_idx, 7 - file_idx
+    def _square_center(self, square):
+        row, col = self._square_to_rc(square)
+        x = self.MARGIN + col * self.SQ + self.SQ // 2
+        y = self.MARGIN + row * self.SQ + self.SQ // 2
+        return x, y
+
+    def _viewing_live(self):
+        return self.view_index == len(self.board.move_stack)
+
+    def _view_board(self):
+        if self._viewing_live():
+            return self.board
+        replay = chess.Board()
+        for m in list(self.board.move_stack)[: self.view_index]:
+            replay.push(m)
+        return replay
+
+    def _push_move(self, move):
+        san = self.board.san(move)
+        was_live = self._viewing_live()
+        self.board.push(move)
+        self.san_history.append(san)
+        if was_live:
+            self.view_index = len(self.board.move_stack)
+        self._refresh_move_list()
+        self.render()
+
+    def _refresh_move_list(self):
+        self.move_listbox.delete(0, "end")
+        for i, san in enumerate(self.san_history):
+            move_no = i // 2 + 1
+            sep = "." if i % 2 == 0 else "…"
+            self.move_listbox.insert("end", f"{move_no:>3}{sep} {san}")
+        self._sync_listbox()
+
+    def _sync_listbox(self):
+        self.move_listbox.selection_clear(0, "end")
+        if self.view_index > 0:
+            idx = self.view_index - 1
+            self.move_listbox.selection_set(idx)
+            self.move_listbox.see(idx)
+
+    def go_start(self):
+        self.view_index = 0
+        self.selected = None
+        self._sync_listbox()
+        self.render()
+
+    def go_back(self):
+        if self.view_index > 0:
+            self.view_index -= 1
+            self.selected = None
+            self._sync_listbox()
+            self.render()
+
+    def go_forward(self):
+        if self.view_index < len(self.board.move_stack):
+            self.view_index += 1
+            self.selected = None
+            self._sync_listbox()
+            self.render()
+
+    def go_end(self):
+        self.view_index = len(self.board.move_stack)
+        self.selected = None
+        self._sync_listbox()
+        self.render()
+
+    def on_move_listbox_select(self, _event):
+        sel = self.move_listbox.curselection()
+        if not sel:
+            return
+        self.view_index = sel[0] + 1
+        self.selected = None
+        self.render()
 
     def render(self):
+        c = self.canvas
+        c.delete("all")
+        board = self._view_board()
+        last_move = board.peek() if board.move_stack else None
+
         legal_targets = set()
-        if self.selected is not None:
+        if self.selected is not None and self._viewing_live():
             legal_targets = {
-                move.to_square
-                for move in self.board.legal_moves
-                if move.from_square == self.selected
+                m.to_square
+                for m in self.board.legal_moves
+                if m.from_square == self.selected
             }
 
+        for sq in chess.SQUARES:
+            f = chess.square_file(sq)
+            r = chess.square_rank(sq)
+            light = (f + r) % 2 == 1
+            row, col = self._square_to_rc(sq)
+            x0 = self.MARGIN + col * self.SQ
+            y0 = self.MARGIN + row * self.SQ
+            x1 = x0 + self.SQ
+            y1 = y0 + self.SQ
+            color = self.LIGHT if light else self.DARK
+            if last_move is not None and (
+                sq == last_move.from_square or sq == last_move.to_square
+            ):
+                color = self.LAST_LIGHT if light else self.LAST_DARK
+            if sq == self.selected and self._viewing_live():
+                color = self.SELECT_LIGHT if light else self.SELECT_DARK
+            c.create_rectangle(x0, y0, x1, y1, fill=color, width=0)
+
+        small_font = ("Segoe UI", 9, "bold")
+        files = "abcdefgh" if self.human_color == chess.WHITE else "hgfedcba"
+        for col, ch in enumerate(files):
+            sq_file = col if self.human_color == chess.WHITE else 7 - col
+            sq_rank = 0 if self.human_color == chess.WHITE else 7
+            light = (sq_file + sq_rank) % 2 == 1
+            text_color = self.DARK if light else self.LIGHT
+            x = self.MARGIN + col * self.SQ + self.SQ - 4
+            y = self.MARGIN + 8 * self.SQ - 2
+            c.create_text(x, y, text=ch, anchor="se",
+                          fill=text_color, font=small_font)
         for row in range(8):
-            for col in range(8):
-                square = self.row_col_to_square(row, col)
-                piece = self.board.piece_at(square)
-                button = self.buttons[(row, col)]
-                color = self.light_square if (row + col) % 2 == 0 else self.dark_square
-                if square == self.selected:
-                    color = self.selected_square
-                elif square in legal_targets:
-                    color = self.legal_square
-                button.configure(
-                    text=self.pieces.get(piece.symbol(), "") if piece else "",
-                    bg=color,
-                    activebackground=color,
-                )
+            sq_rank = 7 - row if self.human_color == chess.WHITE else row
+            sq_file = 0 if self.human_color == chess.WHITE else 7
+            light = (sq_file + sq_rank) % 2 == 1
+            text_color = self.DARK if light else self.LIGHT
+            x = self.MARGIN + 2
+            y = self.MARGIN + row * self.SQ + 2
+            c.create_text(x, y, text=str(sq_rank + 1), anchor="nw",
+                          fill=text_color, font=small_font)
+
+        for tgt in legal_targets:
+            x, y = self._square_center(tgt)
+            if board.piece_at(tgt) is None:
+                r = self.SQ // 8
+                c.create_oval(x - r, y - r, x + r, y + r,
+                              fill=self.DOT, outline="")
+            else:
+                r = self.SQ // 2 - 4
+                c.create_oval(x - r, y - r, x + r, y + r,
+                              outline=self.DOT, width=4)
+
+        font = ("Segoe UI Symbol", int(self.SQ * 0.7))
+        offsets = [(-1, 0), (1, 0), (0, -1), (0, 1),
+                   (-1, -1), (1, -1), (-1, 1), (1, 1)]
+        for sq in chess.SQUARES:
+            piece = board.piece_at(sq)
+            if piece is None:
+                continue
+            glyph = self.GLYPH[piece.piece_type]
+            if piece.color == chess.WHITE:
+                fill, outline = self.WHITE_FILL, self.WHITE_OUTLINE
+            else:
+                fill, outline = self.BLACK_FILL, self.BLACK_OUTLINE
+            x, y = self._square_center(sq)
+            for dx, dy in offsets:
+                c.create_text(x + dx, y + dy, text=glyph,
+                              fill=outline, font=font)
+            c.create_text(x, y, text=glyph, fill=fill, font=font)
 
         if self.game.is_terminal(self.board):
-            self.status.set(f"Game over: {self.game.get_result(self.board)}")
+            msg = f"Game over: {self.game.get_result(self.board)}"
+        elif not self._viewing_live():
+            msg = (
+                f"Reviewing move {self.view_index}/"
+                f"{len(self.board.move_stack)} — press → to return"
+            )
+        elif self.thinking:
+            msg = "Model is thinking…"
         elif self.board.turn == self.human_color:
-            self.status.set("Your move")
+            msg = "Your move"
         else:
-            self.status.set("Model is thinking...")
+            msg = "Model to move"
+        self.status.set(msg)
 
-    def on_square_click(self, row, col):
+    def on_canvas_click(self, event):
+        if not self._viewing_live():
+            self.view_index = len(self.board.move_stack)
+            self.selected = None
+            self._sync_listbox()
+            self.render()
+            return
         if self.game.is_terminal(self.board) or self.board.turn != self.human_color:
             return
-
-        square = self.row_col_to_square(row, col)
-        piece = self.board.piece_at(square)
+        sq = self._xy_to_square(event.x, event.y)
+        if sq is None:
+            return
+        piece = self.board.piece_at(sq)
         if self.selected is None:
             if piece is not None and piece.color == self.human_color:
-                self.selected = square
+                self.selected = sq
                 self.render()
             return
-
-        move = chess.Move(self.selected, square)
-        promotion_move = chess.Move(self.selected, square, promotion=chess.QUEEN)
-        if promotion_move in self.board.legal_moves:
-            move = promotion_move
-
+        move = chess.Move(self.selected, sq)
+        promo = chess.Move(self.selected, sq, promotion=chess.QUEEN)
+        if promo in self.board.legal_moves:
+            move = promo
         if move in self.board.legal_moves:
-            self.board.push(move)
             self.selected = None
-            self.render()
+            self._push_move(move)
             self.root.after(100, self.maybe_model_move)
             return
-
         if piece is not None and piece.color == self.human_color:
-            self.selected = square
+            self.selected = sq
         else:
             self.selected = None
         self.render()
@@ -1480,21 +1710,20 @@ class ChessGUI:
         if self.game.is_terminal(self.board) or self.board.turn == self.human_color:
             self.render()
             return
-
+        self.thinking = True
         self.render()
         self.root.update_idletasks()
         try:
             action = choose_model_action(
-                self.game,
-                self.board,
-                self.model,
-                self.simulations,
+                self.game, self.board, self.model, self.simulations,
             )
             move = self.game.action_to_move(action, self.board)
-            self.board.push(move)
         except Exception as exc:
+            self.thinking = False
             self.messagebox.showerror("Model move failed", str(exc))
-        self.render()
+            return
+        self.thinking = False
+        self._push_move(move)
 
 
 def gui_command(args):
