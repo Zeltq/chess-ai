@@ -340,7 +340,7 @@ def append_metrics_row(path, row):
         writer.writerow(row)
 
 
-def save_self_play_pgn(path, moves, result, iteration, game_index):
+def save_self_play_pgn(path, moves, result, iteration, game_index, starting_fen=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     pgn_game = chess.pgn.Game()
     pgn_game.headers["Event"] = "AlphaZero self-play"
@@ -350,9 +350,13 @@ def save_self_play_pgn(path, moves, result, iteration, game_index):
     pgn_game.headers["White"] = f"AlphaZero iter {iteration}"
     pgn_game.headers["Black"] = f"AlphaZero iter {iteration}"
     pgn_game.headers["Result"] = result
+    if starting_fen is not None:
+        board = chess.Board(starting_fen)
+        pgn_game.setup(board)
+    else:
+        board = chess.Board()
 
     node = pgn_game
-    board = chess.Board()
     for move in moves:
         node = node.add_variation(move)
         board.push(move)
@@ -749,11 +753,26 @@ def train_command(args):
 
             pgn_path = None
             if args.record_games is None or game_index <= args.record_games:
-                pgn_path = (
-                    args.records_dir
-                    / f"{run_id}_iter_{iteration:04d}_game_{game_index:02d}.pgn"
+                starting_fen = game_stats.get("starting_fen")
+                if game_stats.get("endgame_curriculum"):
+                    # Endgame-curriculum games get a distinct name so it's easy
+                    # to see at a glance whether the model delivered mate
+                    # (result in filename: 1-0 / 0-1 / draw; adjudication is
+                    # disabled for these games, so a decisive result == mate).
+                    result_tag = {"1-0": "1-0", "0-1": "0-1"}.get(result, "draw")
+                    pgn_path = (
+                        args.records_dir
+                        / f"{run_id}_iter_{iteration:04d}_endgame_{game_index:02d}_{result_tag}.pgn"
+                    )
+                else:
+                    pgn_path = (
+                        args.records_dir
+                        / f"{run_id}_iter_{iteration:04d}_game_{game_index:02d}.pgn"
+                    )
+                save_self_play_pgn(
+                    pgn_path, moves, result, iteration, game_index,
+                    starting_fen=starting_fen,
                 )
-                save_self_play_pgn(pgn_path, moves, result, iteration, game_index)
 
             metrics = None
             if eval_engine is not None and game_index <= args.eval_games:

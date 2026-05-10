@@ -154,11 +154,13 @@ def self_play_game(
             np.random.randint(0, len(ENDGAME_STARTING_FENS))
         ]
         state = chess.Board(fen)
+        starting_fen = fen
         # Disable adjudication for this game — force the model to actually
         # deliver mate; otherwise it never learns the technique.
         effective_adjudicate_material = None
     else:
         state = game.get_initial_state()
+        starting_fen = None
         effective_adjudicate_material = adjudicate_material
 
     history = []
@@ -306,5 +308,6 @@ def self_play_game(
         "reused_visits_moves": reused_visits_moves,
         "adjudicated": adjudicated_result is not None,
         "endgame_curriculum": started_from_endgame,
+        "starting_fen": starting_fen,
     }
     return samples, state, moves, result, stats
